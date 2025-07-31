@@ -1,0 +1,385 @@
+---
+title: "GVEX_LIBD_analysis"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library(markerGeneProfile)
+library(matrixStats)
+library(cowplot)
+library(broom)
+library(knitr)
+library(ggpubr)
+library(biomaRt)
+theme_set(theme_cowplot())
+```
+
+
+Combining .results from GVEX
+```{r}
+#Create vectors with gene and isoform filenames
+csv_dir <- "/external/rprshnas01/netdata_kcni/stlab/PsychENCODE/BrainGVEX/RNAseq/"
+gene_csv <- list.files(path = csv_dir, pattern = "\\genes.results$")
+isoform_csv <- list.files(path = csv_dir, pattern = "\\isoforms.results$")
+
+#Loop through gene files
+setwd(csv_dir)
+for (i in 1:length(gene_csv)) {
+  curr_file <- gene_csv[i] # get current file 
+  sample_matrix <- read.delim(file = paste(csv_dir, curr_file, sep = "")) # intake current file table
+  sample_name <- gsub("\\..*","", curr_file) # get sample name (approximate)
+  colnames(sample_matrix)[5] <- sample_name # set sample name over expected counts column
+  sample_matrix <- sample_matrix[,c("gene_id", sample_name)] # take columns of interest
+  if (i == 1) {
+  gene_count_matrix <- sample_matrix
+  } else {
+  gene_count_matrix <- left_join(gene_count_matrix, sample_matrix, by = "gene_id")
+  }
+}
+row.names(gene_count_matrix) <- gene_count_matrix$gene_id # set row names as gene names
+gene_count_matrix <- gene_count_matrix[-1] # remove gene name column to make object pure matrix
+write.csv(gene_count_matrix, "/external/rprshnas01/kcni/dkiss/KCNI_data_analyses/GVEX_count_matrix.csv", row.names = T)
+
+```
+
+
+Combining .results from LIBD
+```{r}
+#Create vectors with gene and isoform filenames
+csv_dir <- "/external/rprshnas01/netdata_kcni/stlab/PsychENCODE/LIBD__szControl/RNAseq/"
+gene_csv <- list.files(path = csv_dir, pattern = "\\genes.results$")
+isoform_csv <- list.files(path = csv_dir, pattern = "\\isoforms.results$")
+
+#Loop through gene files
+setwd(csv_dir)
+for (i in 1:length(gene_csv)) {
+  curr_file <- gene_csv[i] # get current file 
+  sample_matrix <- read.delim(file = paste(csv_dir, curr_file, sep = "")) # intake current file table
+  sample_name <- gsub("\\..*","", curr_file) # get sample name (approximate)
+  colnames(sample_matrix)[5] <- sample_name # set sample name over expected counts column
+  sample_matrix <- sample_matrix[,c("gene_id", sample_name)] # take columns of interest
+  if (i == 1) {
+  gene_count_matrix <- sample_matrix
+  } else {
+  gene_count_matrix <- left_join(gene_count_matrix, sample_matrix, by = "gene_id")
+  }
+}
+row.names(gene_count_matrix) <- gene_count_matrix$gene_id # set row names as gene names
+gene_count_matrix <- gene_count_matrix[-1] # remove gene name column to make object pure matrix
+write.csv(gene_count_matrix, "/external/rprshnas01/kcni/dkiss/KCNI_data_analyses/LIBD_count_matrix.csv", row.names = T)
+
+
+```
+
+Combining results from CMC
+```{r}
+#Create vectors with gene and isoform filenames
+csv_dir <- "/external/rprshnas01/netdata_kcni/stlab/PsychENCODE/CMC/RNA/"
+gene_csv <- list.files(path = csv_dir, pattern = "\\genes.results$")
+isoform_csv <- list.files(path = csv_dir, pattern = "\\isoforms.results$")
+
+#Loop through gene files
+setwd(csv_dir)
+for (i in 1:length(gene_csv)) {
+  curr_file <- gene_csv[i] # get current file 
+  sample_matrix <- read.delim(file = paste(csv_dir, curr_file, sep = "")) # intake current file table
+  sample_name <- gsub("\\..*","", curr_file) # get sample name (approximate)
+  colnames(sample_matrix)[5] <- sample_name # set sample name over expected counts column
+  sample_matrix <- sample_matrix[,c("gene_id", sample_name)] # take columns of interest
+  if (i == 1) {
+  gene_count_matrix <- sample_matrix
+  } else {
+  gene_count_matrix <- left_join(gene_count_matrix, sample_matrix, by = "gene_id")
+  }
+}
+row.names(gene_count_matrix) <- gene_count_matrix$gene_id # set row names as gene names
+gene_count_matrix <- gene_count_matrix[-1] # remove gene name column to make object pure matrix
+write.csv(gene_count_matrix, "/external/rprshnas01/kcni/dkiss/KCNI_data_analyses/CMC_count_matrix.csv", row.names = F, col.names = T)
+
+```
+
+
+Load and format saved matrices and format for ease of access
+```{r}
+GVEX_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/GVEX_count_matrix.csv")
+names(GVEX_matrix) = gsub("X", '', names(GVEX_matrix))
+names(GVEX_matrix)[1] = "gene_symbol"
+LIBD_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/LIBD_count_matrix.csv")
+names(LIBD_matrix) = gsub("X", '', names(LIBD_matrix))
+names(LIBD_matrix)[1] = "gene_symbol"
+CMC_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/CMC_count_matrix.csv")
+names(CMC_matrix) = gsub("X", '', names(CMC_matrix))
+names(CMC_matrix)[1] = "gene_symbol"
+
+#Rename Ensembl id to be compatible with gene names
+GVEX_matrix$gene_symbol = gsub("\\..*", '', GVEX_matrix$gene_symbol)
+LIBD_matrix$gene_symbol = gsub("\\..*", '', LIBD_matrix$gene_symbol)
+CMC_matrix$gene_symbol = gsub("\\..*", '', CMC_matrix$gene_symbol)
+
+#Make EnsemblIDs row names
+row.names(GVEX_matrix) = GVEX_matrix$gene_symbol
+GVEX_matrix = GVEX_matrix[,-1]
+row.names(LIBD_matrix) = LIBD_matrix$gene_symbol
+LIBD_matrix = LIBD_matrix[,-1]
+row.names(CMC_matrix) = CMC_matrix$gene_symbol
+CMC_matrix = CMC_matrix[,-1]
+```
+
+Import Metadata
+```{r}
+GVEX_metadata = read.delim("//external/rprshnas01/external_data/psychencode/PsychENCODE//BrainGVEX/RNAseq/SYNAPSE_METADATA_MANIFEST.tsv") %>% subset(dataType == "geneExpression") #%>% select(specimenID, PMI, hemisphere, pH, BrodmannArea, RIN)
+LIBD_metadata = read.delim("/external/rprshnas01/external_data/psychencode/PsychENCODE/LIBD__szControl/RNAseq/SYNAPSE_METADATA_MANIFEST.tsv") %>% subset(dataType == "geneExpression") 
+CMC_metadata = read.csv("/external/rprshnas01/external_data/psychencode/PsychENCODE/CMC/Metadata/SYNAPSE_TABLE_QUERY_123020650.csv")
+names(CMC_metadata)[names(CMC_metadata) == "Individual_ID"] = "individualID"
+
+psychencode_metadata = read.csv(("//external/rprshnas01/external_data/psychencode/PsychENCODE/Metadata/CapstoneCollection_Metadata_Clinical.csv"))
+
+GVEX_metadata = GVEX_metadata %>% inner_join(psychencode_metadata) %>% filter(dataType == "geneExpression" & fileFormat == "tsv")
+LIBD_metadata = LIBD_metadata %>% inner_join(psychencode_metadata) %>% filter(dataType == "geneExpression" & fileFormat == "tsv")
+CMC_metadata = CMC_metadata %>% inner_join(psychencode_metadata)%>% filter(dataType == "geneExpression" & fileFormat == "tsv") 
+
+```
+
+Normalize and Process 
+```{r}
+#Convert matrices to counts per million
+GVEX_cpm = cpm(GVEX_matrix,
+               log = TRUE, prior.count = 0.1)
+LIBD_cpm = cpm(LIBD_matrix, log = TRUE, prior.count = 0.1)
+CMC_cpm = cpm(CMC_matrix, log = TRUE, prior.count = 0.1)
+
+#Remove genes with low standard deviations
+GVEX_sds = rowSds(GVEX_cpm, na.rm = T) 
+LIBD_sds = rowSds(LIBD_cpm, na.rm = T)
+CMC_sds = rowSds(CMC_cpm, na.rm = T)
+GVEX_matrix = GVEX_cpm[GVEX_sds > 0.1, ] %>% as.data.frame() %>% rownames_to_column( var = "gene_symbol") 
+LIBD_matrix = LIBD_cpm[LIBD_sds > 0.1, ] %>% as.data.frame() %>% rownames_to_column( var = "gene_symbol") 
+CMC_matrix = CMC_cpm[CMC_sds > 0.1, ] %>% as.data.frame() %>% rownames_to_column( var = "gene_symbol")
+```
+
+
+```{r}
+#Converting Ensembl ID to Gene Name
+mart = useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org/") 
+ensembl = getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id","description","gene_biotype","percentage_gene_gc_content"), mart = mart) 
+ensembl_to_gene = (data.frame(ensembl$ensembl_gene_id, ensembl$hgnc_symbol))
+names(ensembl_to_gene) = c("gene_symbol", "gene_name")
+#remove duplicates
+ensembl_to_gene = ensembl_to_gene[!duplicated(ensembl_to_gene[,1]),]
+
+GVEX_matrix = merge(x=GVEX_matrix, y=ensembl_to_gene, by = "gene_symbol", all.x = T)
+LIBD_matrix = merge(x=LIBD_matrix, y=ensembl_to_gene, by = "gene_symbol", all.x = T)
+CMC_matrix = merge(x=CMC_matrix, y=ensembl_to_gene, by = "gene_symbol", all.x = T)
+```
+
+
+Cell-Type Proportion Estimation: Try updated marker list from Micaela's paper
+```{r}
+### GET MARKERS FOR MGP ANALYSIS
+# note that this is the list of markers from micaela's paper - you get similar but diff results if you use the markers from the aging paper
+sonny_markers = read_csv(url('https://raw.githubusercontent.com/sonnyc247/MarkerSelection/master/Data/Outputs/CSVs_and_Tables/Markers/MTG_and_CgG_lfct2/new_MTGnCgG_lfct2.5_Publication.csv'))
+colnames(sonny_markers) = colnames(sonny_markers) %>% make.names() %>% tolower()
+
+# I find it helpful to map some gene symbols to ensembl ids manually using mappings from hgnc, you can get those from here: 
+# http://ftp.ebi.ac.uk/pub/databases/genenames/hgnc/tsv/hgnc_complete_set.txt
+
+hgnc_mapping = read_tsv('/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/hgnc_complete_set.txt')
+
+# now, this is the list of sonnys markers with entrez ids and ensembl ids where possible
+sonny_hgnc_merged_markers = left_join(sonny_markers %>% dplyr::rename(entrez_id = entrez.gene.id), 
+                                      hgnc_mapping %>% distinct(entrez_id, .keep_all = T)%>% 
+                                        dplyr::select(entrez_id, ensembl_gene_id) %>% 
+                                        dplyr::rename(ensembl_id = ensembl_gene_id)) %>% 
+  dplyr::select(gene, entrez_id, ensembl_id, -ensembl.gene.id, everything()) %>% 
+  group_by(subclass) %>% 
+  arrange(subclass, -average.log.fold.change) %>% 
+  ungroup()
+
+# get ensembl list of markers
+new_markers = sonny_hgnc_merged_markers %>% filter(used.in.mgp == "TRUE")
+new_cell_types = new_markers %>% filter(!is.na(subclass)) %>% pull(subclass) %>% unique
+new_marker_list  = lapply(new_cell_types, function(cell_type){
+  return(new_markers %>% filter(subclass == cell_type, 
+                                ensembl_id %in% unique(c(GVEX_matrix$gene_symbol, LIBD_matrix$gene_symbol, CMC_matrix$gene_symbol)),
+  ) %>% pull(ensembl_id))
+})
+names(new_marker_list) = c('Astrocyte', 'Endothelial', 'Exc_IT', 'Exc_L4_IT', 'Exc_L5_ET', 'Exc_L5/6_IT_Car3', 'Exc_L5/6_NP', 'Exc_L6_CT', 'Exc_L6b', 'Inh_LAMP5', 'Microglia', 'Oligodendrocyte', 'OPC', 'Inh_PAX6', 'Pericyte', 'Inh_PVALB', 'Inh_SST', 'Inh_VIP', 'VLMC')
+print(new_cell_types)
+
+write_rds(new_marker_list, "/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/marker_list.rds")
+```
+
+
+GVEX: mgpEstimate to get cell type proportions
+```{r}
+#Estimation counts NULL as a gene - so remove all NULL gene names to avoid duplicates
+gvex_genes_only = GVEX_matrix %>% subset(gene_symbol != "")
+if(length(which(duplicated(gvex_genes_only$gene_symbol))) != 0){
+  gvex_genes_only = gvex_genes_only[-which(duplicated(gvex_genes_only$gene_symbol)),]
+}
+
+#Remove ensembl_ID and move gene names to first column 
+gvex_genes_only[,1] = gvex_genes_only$gene_symbol
+colnames(gvex_genes_only)[1] = "gene_name"
+gvex_genes_only = gvex_genes_only[, -(ncol(gvex_genes_only))]
+
+gvex_estimations =  mgpEstimate(
+  exprData = gvex_genes_only,
+  genes = new_marker_list,
+  geneColName = 'gene_name',
+  outlierSampleRemove = F, # should outlier samples removed. This is done using boxplot stats
+  geneTransform = NULL, # this is the default option for geneTransform
+  groups = NULL, # if there are experimental groups provide them here. if not desired set to NULL
+  seekConsensus = FALSE, # ensures gene rotations are positive in both of the groups
+  removeMinority = FALSE)
+
+#Coerce estimations list into data frame 
+gvex_estimations_scaled = gvex_estimations$estimates %>% as.data.frame() %>% scale() %>% as.data.frame() %>% tibble::rownames_to_column(var = "specimenID")
+
+
+#Merge cell type proportions with sample metadata
+gvex_estimations_metadata = inner_join(GVEX_metadata %>% mutate(specimenID = make.names(specimenID)), 
+                                       gvex_estimations_scaled %>% mutate(specimenID = make.names(specimenID)))
+
+#Remove '+' from ageDeath for modelling
+gvex_estimations_metadata$ageDeath = as.numeric(gsub("[+]", "", gvex_estimations_metadata$ageDeath))
+
+write.csv(gvex_estimations_metadata, "/external/rprshnas01/kcni/dkiss/KCNI_data_analyses/gvex_cell_prop.csv")
+
+```
+
+LIBD: mgpEstimate to get cell type proportions
+```{r}
+#Estimation counts NULL as a gene - so remove all NULL gene names to avoid duplicates
+libd_genes_only = LIBD_matrix %>% subset(gene_symbol != "")
+if(length(which(duplicated(libd_genes_only$gene_symbol))) != 0){
+  libd_genes_only = libd_genes_only[-which(duplicated(libd_genes_only$gene_symbol)),]
+}
+
+#Remove ensembl_ID and move gene names to first column 
+libd_genes_only[,1] = libd_genes_only$gene_symbol
+colnames(libd_genes_only)[1] = "gene_name"
+libd_genes_only = libd_genes_only[, -(ncol(libd_genes_only))]
+
+libd_estimations =  mgpEstimate(
+  exprData = libd_genes_only,
+  genes = new_marker_list,
+  geneColName = 'gene_name',
+  outlierSampleRemove = F, # should outlier samples removed. This is done using boxplot stats
+  geneTransform = NULL, # this is the default option for geneTransform
+  groups = NULL, # if there are experimental groups provide them here. if not desired set to NULL
+  seekConsensus = FALSE, # ensures gene rotations are positive in both of the groups
+  removeMinority = F)
+
+#Coerce estimations list into data frame 
+libd_estimations_scaled = libd_estimations$estimates %>% as.data.frame() %>% scale() %>% as.data.frame() %>% tibble::rownames_to_column(var = "specimenID")
+
+
+#Merge cell type proportions with sample metadata
+libd_estimations_metadata = inner_join(LIBD_metadata %>% mutate(specimenID = make.names(specimenID)), 
+                                       libd_estimations_scaled %>% mutate(specimenID = make.names(specimenID)))
+
+#Remove '+' from ageDeath for modelling
+libd_estimations_metadata$ageDeath = as.numeric(gsub("[+]", "", libd_estimations_metadata$ageDeath))
+
+write.csv(libd_estimations_metadata, "/external/rprshnas01/kcni/dkiss/KCNI_data_analyses/libd_cell_prop.csv")
+
+```
+
+CMC: mgpEstimate to get cell type proportions
+```{r}
+#Estimation counts NULL as a gene - so remove all NULL gene names to avoid duplicates
+cmc_genes_only = CMC_matrix %>% subset(gene_symbol != "")
+if(length(which(duplicated(cmc_genes_only$gene_symbol))) != 0){
+  cmc_genes_only = cmc_genes_only[-which(duplicated(cmc_genes_only$gene_symbol)),]
+}
+
+#Remove ensembl_ID and move gene names to first column 
+cmc_genes_only[,1] = cmc_genes_only$gene_symbol
+colnames(cmc_genes_only)[1] = "gene_name"
+cmc_genes_only = cmc_genes_only[, -(ncol(cmc_genes_only))]
+
+cmc_estimations =  mgpEstimate(
+  exprData = cmc_genes_only,
+  genes = new_marker_list,
+  geneColName = 'gene_name',
+  outlierSampleRemove = F, # should outlier samples removed. This is done using boxplot stats
+  geneTransform = NULL, # this is the default option for geneTransform
+  groups = NULL, # if there are experimental groups provide them here. if not desired set to NULL
+  seekConsensus = FALSE, # ensures gene rotations are positive in both of the groups
+  removeMinority = F)
+
+#Coerce estimations list into data frame 
+cmc_estimations_scaled = cmc_estimations$estimates %>% as.data.frame() %>% scale() %>% as.data.frame() %>% tibble::rownames_to_column(var = "specimenID")
+
+names(cmc_estimations_scaled)[names(cmc_estimations_scaled) == "specimenID"] = "individualID"
+
+#Merge cell type proportions with sample metadata
+#Change column name for join
+cmc_estimations_metadata = right_join(CMC_metadata, cmc_estimations_scaled)
+
+#Remove '+' from ageDeath for modelling
+cmc_estimations_metadata$ageDeath = as.numeric(gsub("[+]", "", cmc_estimations_metadata$ageDeath))
+
+write.csv(cmc_estimations_metadata, "/external/rprshnas01/kcni/dkiss/KCNI_data_analyses/cmc_cell_prop.csv")
+
+```
+
+Rerun CMC to see if cohort-specific MGP-estimate changes results:
+```{r}
+
+mssm_individuals = CMC_metadata %>% filter(individualIdSource == "MSSM") %>% pull(individualID) %>% unique()
+penn_individuals =  CMC_metadata %>% filter(individualIdSource == "Penn") %>% pull(individualID)%>% unique()
+pitt_individuals = CMC_metadata %>% filter(individualIdSource == "Pitt") %>% pull(individualID) %>% unique()
+gene_symbol = CMC_matrix$gene_symbol
+
+mssm_matrix = CMC_matrix[, mssm_individuals] %>% cbind(gene_symbol)
+penn_matrix = CMC_matrix[, penn_individuals] %>% cbind(gene_symbol)
+pitt_matrix = CMC_matrix[, colnames(CMC_matrix) %>% intersect(pitt_individuals)] %>% cbind(gene_symbol)
+
+matrix_names = c("mssm_matrix", "penn_matrix", "pitt_matrix")
+
+cmc_estimations_NEW = setNames(data.frame(matrix(ncol = 76, nrow = 0)), colnames(cmc_estimations_metadata))
+for(matrix in matrix_names) {
+  
+  genes_only = get(matrix) %>% subset(gene_symbol != "")
+  
+if(length(which(duplicated(genes_only$gene_symbol))) != 0){
+  genes_only = genes_only[-which(duplicated(genes_only$gene_symbol)),]
+}
+#Remove ensembl_ID and move gene names to first column 
+genes_only[,1] = genes_only$gene_symbol
+colnames(genes_only)[1] = "gene_name"
+genes_only = genes_only[, -(ncol(genes_only))]
+
+estimations =  mgpEstimate(
+  exprData = genes_only,
+  genes = new_marker_list,
+  geneColName = 'gene_name',
+  outlierSampleRemove = F, # should outlier samples removed. This is done using boxplot stats
+  geneTransform = NULL, # this is the default option for geneTransform
+  groups = NULL, # if there are experimental groups provide them here. if not desired set to NULL
+  seekConsensus = FALSE, # ensures gene rotations are positive in both of the groups
+  removeMinority = F)
+
+#Coerce estimations list into data frame 
+estimations_scaled = estimations$estimates %>% as.data.frame() %>% scale() %>% as.data.frame() %>% tibble::rownames_to_column(var = "specimenID")
+
+names(estimations_scaled)[names(estimations_scaled) == "specimenID"] = "individualID"
+
+#Merge cell type proportions with sample metadata
+#Change column name for join
+estimations_metadata = right_join(CMC_metadata, estimations_scaled )
+
+#Remove '+' from ageDeath for modelling
+estimations_metadata$ageDeath = as.numeric(gsub("[+]", "", estimations_metadata$ageDeath))
+
+cmc_estimations_NEW = rbind(cmc_estimations_NEW, estimations_metadata)
+}
+
+write.csv(cmc_estimations_NEW, "/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/cmc_cell_prop_NEW.csv")
+```
+

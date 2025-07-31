@@ -1,0 +1,193 @@
+---
+title: "psychencode_DE_file_generation"
+author: "Daniel Kiss"
+date: "8/16/2023"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(Seurat)
+  library(edgeR)
+  library(ggrepel)
+  library(cowplot)
+  library(limma)
+  library(ggpubr)
+  library(gprofiler2)
+  library(EnhancedVolcano)
+  library(patchwork)
+})
+theme_set(theme_classic2())
+#Colour palette
+cbPalette <- c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+
+Load and format data/variables
+```{r}
+pseudobulk = read.csv("~/cell_prop_psychiatry/data/psychencode_label_transferred_pseudobulk_raw.csv")[,-1]
+pseudobulk_metadata = read.csv("~/cell_prop_psychiatry/data/psychencode_label_transferred_pseudobulk_metadata.csv") %>%
+  group_by(ID) %>%
+  mutate(total_cells = sum(num_cells)) %>%
+  ungroup() 
+```
+
+
+Create a list of relevant data for each cell type
+```{r}
+#Define variables
+NUM_CELLS = 1000 #Total cells per donor in all cell types
+AGE_THRESH = 70 
+CELL_TYPES = c("SST", "PVALB", "VIP")
+DATASET = c("McLean", "MtSinai")
+
+DE_data = list()
+#Loop through ALL cell types and perform above analyses
+for(CELL_TYPE in CELL_TYPES) {
+  #Define subjects based on cell type, cohort, and min cell number
+  under_70_subjects = pseudobulk_metadata %>% filter(Celltype == CELL_TYPE, total_cells > NUM_CELLS, Age <= 70, Cohort %in% DATASET) %>% 
+  pull(ID)
+  over_70_subjects = pseudobulk_metadata %>% filter(Celltype == CELL_TYPE, total_cells > NUM_CELLS, Age > 70, Cohort %in% DATASET) %>% 
+  pull(ID)
+  #Define filtering variables 
+  UNDER_70_SCZ = pseudobulk_metadata %>% filter(ID %in% under_70_subjects, Celltype == CELL_TYPE, Phenotype == "SZ") %>% pull(ID)
+  UNDER_70_CON = pseudobulk_metadata %>% filter(ID %in% under_70_subjects, Celltype == CELL_TYPE, Phenotype == "CON") %>% pull(ID)
+  OVER_70_SCZ = pseudobulk_metadata %>% filter(ID %in% over_70_subjects, Celltype == CELL_TYPE, Phenotype == "SZ") %>% pull(ID)
+  OVER_70_CON = pseudobulk_metadata %>% filter(ID %in% over_70_subjects, Celltype == CELL_TYPE, Phenotype == "CON") %>% pull(ID)
+  #Skip cell type if no subjects make it past filtering
+  if(length(UNDER_70_SCZ) < 5 || length(UNDER_70_CON) < 5 || length(OVER_70_SCZ) < 5 || length(OVER_70_CON) < 5) {
+    next  # Skip to the next iteration of the loop
+  }
+  #Define model variables for under 70
+  disease = factor( pseudobulk_metadata %>% filter(ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% 
+    pull(Phenotype), levels = c('CON', 'SZ'))
+  sex =  pseudobulk_metadata %>% filter(ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% 
+    pull(Gender)
+  pmi =  pseudobulk_metadata %>% 
+  filter(ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(PMI)
+  age =  pseudobulk_metadata %>% 
+  filter(ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(Age)
+  log_10_cells_per_donor =  pseudobulk_metadata %>% 
+  filter(ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(num_cells) %>% log10()
+  cohort = if (length(unique(DATASET)) > 1) pseudobulk_metadata %>% 
+  filter(ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(Cohort) else NULL
+  #Create model matrix 
+  design_under_70 = model.matrix(~ age + pmi + sex + log_10_cells_per_donor + disease) 
+  
+    #Define model variables for over 70
+  disease = factor( pseudobulk_metadata %>% filter(ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% 
+    pull(Phenotype), levels = c('CON', 'SZ'))
+  sex =  pseudobulk_metadata %>% filter(ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% 
+    pull(Gender)
+  pmi =  pseudobulk_metadata %>% 
+  filter(ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(PMI)
+  age =  pseudobulk_metadata %>% 
+  filter(ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(Age)
+  log_10_cells_per_donor =  pseudobulk_metadata %>% 
+  filter(ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(num_cells) %>% log10()
+  cohort = if (length(unique(DATASET)) > 1) pseudobulk_metadata %>% 
+  filter(ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% 
+  pull(Cohort) else NULL
+  #Create model matrix 
+  design_over_70 = model.matrix(~age + pmi + sex + log_10_cells_per_donor +  disease) 
+  
+  #Create count matrices
+  under_70 = pseudobulk_metadata %>% filter(Age <= 70, ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% pull(ID) 
+  counts_under_70 = pseudobulk %>% filter(ID %in% under_70, Celltype == CELL_TYPE)
+  counts_under_70 = counts_under_70[, 3:ncol(counts_under_70)] %>% t() %>% as.data.frame()
+  colnames(counts_under_70) = under_70
+  over_70 = pseudobulk_metadata %>% filter(Age > 70, ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% pull(ID) 
+  counts_over_70 = pseudobulk %>% filter(ID %in% over_70, Celltype == CELL_TYPE)
+  counts_over_70 = counts_over_70[, 3:ncol(counts_over_70)] %>% t() %>% as.data.frame()
+  colnames(counts_over_70) = over_70
+  #Create DGE objects
+  dge_under = DGEList(counts_under_70, genes = row.names(counts_under_70))
+  min_samples <- pseudobulk_metadata %>% filter(ID %in% under_70_subjects, Celltype == CELL_TYPE) %>% nrow * 0.8
+  dge_under = dge_under[rowSums(dge_under$counts >= 1) >= min_samples, ]
+  dge_under = calcNormFactors(dge_under, method = "TMM")
+  dge_over = DGEList(counts_over_70, genes = row.names(counts_over_70))
+  min_samples <- pseudobulk_metadata %>% filter(ID %in% over_70_subjects, Celltype == CELL_TYPE) %>% nrow * 0.8
+  dge_over = dge_over[rowSums(dge_over$counts >= 1) >= min_samples, ]
+  dge_over = calcNormFactors(dge_over, method = "TMM")
+  
+  #Create lists of data for each group
+  under_70_data = list(design_under_70, dge_under)
+  names(under_70_data) = c("design", "dge")
+  over_70_data = list(design_over_70, dge_over)
+  names(over_70_data) = c("design", "dge")
+  joined_data = list(under_70_data, over_70_data)
+  names(joined_data) = c("under_70", "over_70")
+  
+  DE_data[[CELL_TYPE]] = joined_data
+}
+#We now have a nested list with ALL data required for DE analysis for all cell types with >1 subject per age group
+```
+
+Simple volcano plot function 
+```{r}
+simple_volcano <- function(x) {
+  x %>%
+    ggplot(aes(x = logFC, y = -log10(P.Value), label = genes)) + 
+    geom_point() +
+    geom_text_repel(data = subset(x, adj.P.Val < 0.1), 
+                    aes(label = genes), 
+                    vjust = 1.5) + 
+    geom_point(data = subset(x, adj.P.Val < 0.1), 
+               aes(color = 'red')) + 
+    theme_cowplot() +
+    theme(legend.position = "none")
+}
+```
+
+
+Now that we have all data pre-processed and organized for DE analysis, let's loop through DE_data and output results to DE_results (This will take a few minutes to run)
+```{r}
+DE_results = list()
+for(CELL_TYPE in names(DE_data)) {
+  #Load data from DE_data
+  dge_under = DE_data[[CELL_TYPE]]$under_70$dge 
+  dge_over = DE_data[[CELL_TYPE]]$over_70$dge 
+  design_under = DE_data[[CELL_TYPE]]$under_70$design
+  design_over = DE_data[[CELL_TYPE]]$over_70$design
+  #Voom transform
+  vm_under = voom(dge_under, design_under, plot = F) 
+  fit_under = lmFit(vm_under, design_under) %>% eBayes()
+  DE_under = topTable(fit_under, coef = "diseaseSZ",  n = Inf, sort = "none", adjust.method = "BH", confint = T) 
+  vm_over = voom(dge_over, design_over, plot = FALSE) 
+  fit_over = lmFit(vm_over, design_over) %>% eBayes()
+  DE_over = topTable(fit_over, coef = "diseaseSZ", n = Inf, sort = "none", adjust.method = "BH", confint = T)
+  #Plots etc.
+  volcano_under = DE_under %>% simple_volcano()
+  volcano_over = DE_over %>% simple_volcano()
+  tplot = merge(DE_under, DE_over, by = 0) %>% 
+    ggplot(aes(x = t.x, y = t.y)) + 
+    geom_smooth(method = loess) +
+    geom_point(size = 1) +
+    ylab("Over 70") +
+    xlab("Under 70") +
+    ggtitle(paste0(CELL_TYPE, " t-Statistics"))
+  
+  #Append to list
+  joined_results = list(DE_under, DE_over)
+  names(joined_results) = c("DE_under", "DE_over")
+  joined_volcano = list(volcano_under, volcano_over)
+  names(joined_volcano) = c("Under 70", "Over 70")
+  joined_all = list(joined_results, joined_volcano, tplot)
+  names(joined_all) = c("DE_tables", "Volcano_Plots", "t_Plot")
+  DE_results[[CELL_TYPE]] = joined_all
+}
+```
+
+We will run the code above 2x, once for McLean and once for Sinai, then save each result for later use 
+```{r}
+dataset_suffix = if(length(DATASET) > 1) "ALL" else DATASET
+saveRDS(DE_results, file = paste0("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/DE_results_", dataset_suffix))
+```

@@ -1,0 +1,121 @@
+---
+title: "Untitled"
+author: "Daniel Kiss"
+date: "8/26/2024"
+output: html_document
+---
+
+```{r}
+# cell-density-deconvolution.r
+# load libraries ----
+suppressPackageStartupMessages({
+  library(data.table)
+  library(edgeR)
+  library(markerGeneProfile)
+  library(readxl)
+  library(tidyverse)
+  library(Seurat)
+  library(ggbeeswarm)
+  library(ggsignif)
+  library(cowplot)
+  library(ggsci)
+  library(ggpubr)
+  library(patchwork)
+  library(broom)
+  library(stats)
+  library(WGCNA)
+})
+
+```
+
+```{r}
+
+cols_1 = c("Control" = "#3182BDFF", "MDD" = "#E6550DFF", "Bipolar" = "#31A354FF", "SCHIZ" = "#756BB1FF")
+
+# FISH cell densities ----
+# load densities (cells per 0.1 mm^2)
+cell_dens = read_excel("/external/rprshnas01/netdata_kcni/stlab/Collaborators/Sibille/RNAseq_processed/full cell counts(Excel).xlsx") %>% 
+  dplyr::rename(HU = Subject, PVALB = PV, DX = Subject.Group) %>%
+  mutate(DX = factor(DX, levels = c("Control","MDD","Bipolar","SCHIZ"), labels = c("CTRL","MDD","BD","SCZ"))) %>%
+  mutate(HU = as.character(HU)) 
+
+tetrad_path = '/external/rprshnas01/netdata_kcni/stlab/Collaborators/Sibille/RNAseq_processed/'
+tetrad_meta = read_csv(paste0(tetrad_path, "pTable with correct med info.csv"))
+tetrad_meta$sample_names = str_sub(tetrad_meta$X, end=-5) %>% make.names()
+tetrad_meta$sample_names =  gsub("_", ".", tetrad_meta$sample_names)
+
+# prepare metadata ----
+# load metadata and format 
+tetrad_meta = tetrad_meta %>%
+  # define factors and numeric variables explicitly
+  mutate_at(vars("Age","PMI","pH","RNA.Ratio","RIN"), as.numeric) %>%
+  # add scaled numeric variables
+  mutate_at(vars("HU.","Tetrad","MOD","Sex","Race","Tob.ATOD","Hand.Preference"), factor) %>%
+  # set controls as reference level
+  mutate(DX = factor(Subject.Group, levels = c("Control","MDD","Bipolar","SCHIZ")),
+         # standard order for cell types
+         CT = factor(Cell.Type, levels =  c("PVALB","SST","VIP","PyrL2n3","PyrL5n6")))
+
+tetrad_meta$HU = tetrad_meta$HU.
+
+# tidy density data frame and remove outliers by cell type and diagnosis group
+cell_dens_long = tetrad_meta %>%
+  filter(CT %in% c("PVALB","SST", "VIP")) %>%
+  mutate(CT = factor(CT, levels = c("PVALB","SST", "VIP"))) %>%
+  filter(DX %in% c('Control', 'SCHIZ')) %>%
+  dplyr::select(HU, DX, Age, Sex, PMI) %>%
+  right_join(., cell_dens %>% dplyr::select(-DX), by = "HU") %>%
+  dplyr::rename(PyrL2n3 = PYR_23, PyrL5n6 = PYR_56) %>%
+  pivot_longer(cols = c(PyrL2n3, PyrL5n6, PVALB, VIP, SST), names_to = "CT", values_to = "Density") %>%
+  # make sure there are no duplicates 
+  distinct(HU, DX, CT, .keep_all = TRUE) %>%
+  # drop NAs and outliers +/- 3 IQR within each cell type and diagnosis group
+  group_by(CT, DX) %>%
+  filter(!Density %in% boxplot.stats(Density, coef = 3)$out) %>% 
+  ungroup() %>%
+  drop_na()
+
+write.csv(cell_dens_long, "/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/sibille_LCM_long.csv")
+
+```
+
+
+```{r, fig.width= 6, fig.height= }
+p1 = cell_dens_long %>% 
+  filter(CT %in% c("PVALB","SST","VIP")) %>%
+  mutate(CT = factor(CT, levels = c("PVALB","SST","VIP"))) %>%
+  ggplot(aes(x = DX, y = Density * 10, color = DX)) +
+  geom_violin(aes(fill = DX), alpha = 0.4) +
+  geom_quasirandom(na.rm = TRUE, shape = 16, alpha = 0.9) + 
+  stat_summary(fun = mean, geom = "point", aes(fill = DX), size = 4, shape = 23, col = "black") +
+  labs(y = 'Cellular density \n(cells/mm^2, ACC)', x = "", title = "", fill = "Diagnostic group", color = "Diagnostic group") +  
+  scale_x_discrete(labels = c("CON", "SCZ")) +
+  scale_colour_manual(values = c("dodgerblue2", "firebrick2")) +
+  scale_fill_manual(values = c("dodgerblue2", "firebrick2")) +
+  theme_classic2() +
+  theme(
+    plot.title = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.text = element_text(colour = "black"),
+    axis.line = element_line(),
+    strip.text = element_text(face = "bold"),
+    plot.margin = margin(t = 0.5, r = 0.5, b = 0.5, l = 0.5, unit = "cm"),
+    legend.position = "none"
+  ) +
+  facet_wrap(~CT, ncol = 3, scales = "free_y") +
+  geom_signif(
+    comparisons = list(c('Control', "SCHIZ")), 
+    map_signif_level = F, 
+    test = wilcox.test, 
+    textsize = 3, 
+    color = "black"
+  )
+p1
+
+```
+
+
+
+

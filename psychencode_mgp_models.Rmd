@@ -1,0 +1,749 @@
+---
+title: "cell_prop_by_institution"
+author: "Daniel Kiss"
+date: "4/3/2023"
+output: html_document
+---
+Packages etc.
+```{r}
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library(markerGeneProfile) 
+library(matrixStats)
+library(cowplot)
+library(broom)
+library(knitr)
+library(ggpubr)
+library(biomaRt)
+library(ggrepel)
+library(patchwork)
+library(ggsignif)
+library(modelr)
+library(ggbeeswarm)
+theme_set(theme_classic2())
+#Colour palette
+cbPalette <- c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+Loading Data
+```{r}
+#Gene count matrices (in counts/million) with columns for ENSEMBL IDs and gene names 
+GVEX_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/gvex_matrix_cpm.csv")
+LIBD_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/libd_matrix_cpm.csv")
+CMC_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/cmc_matrix_cpm.csv")
+
+#Metadata for individual cohorts + Psychencode -> Merge for ease of access
+GVEX_metadata = read.delim("/external/rprshnas01/netdata_kcni/stlab/PsychENCODE/BrainGVEX/RNAseq/SYNAPSE_METADATA_MANIFEST.tsv") %>% subset(dataType == "geneExpression") #%>% select(specimenID, PMI, hemisphere, pH, BrodmannArea, RIN)
+LIBD_metadata = read.delim("/external/rprshnas01/netdata_kcni/stlab/PsychENCODE/LIBD__szControl/RNAseq/SYNAPSE_METADATA_MANIFEST.tsv") %>% subset(dataType == "geneExpression") 
+CMC_metadata = read.delim("/external/rprshnas01/netdata_kcni/stlab/PsychENCODE/CMC/Metadata/SYNAPSE_METADATA_MANIFEST.tsv") %>% subset(dataType == "geneExpression")
+psychencode_metadata = read.csv(("/external/rprshnas01/netdata_kcni/stlab/PsychENCODE/Metadata/CapstoneCollection_Metadata_Clinical.csv"))
+GVEX_metadata = GVEX_metadata %>% inner_join(psychencode_metadata)
+LIBD_metadata = LIBD_metadata %>% inner_join(psychencode_metadata)
+CMC_metadata = CMC_metadata %>% inner_join(psychencode_metadata)
+
+#LIBD has prenatal samples that can affect MGP estimation - remove before analysis
+LIBD_matrix = LIBD_matrix[,-which(names(LIBD_matrix) %in% (LIBD_metadata$specimenID %>% subset(LIBD_metadata$contributingStudy == "LIBD_szControl" & LIBD_metadata$ageDeath <=0)))]
+
+#Cell type proportions for each data set merged with metadata - ready for modelling 
+gvex_estimations = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/gvex_cell_prop.csv")
+gvex_estimations$dataset = rep("GVEX", nrow(gvex_estimations))
+libd_estimations = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/libd_cell_prop.csv")
+libd_estimations$dataset = rep("LIBD", nrow(libd_estimations))
+libd_estimations[which(is.na(libd_estimations$individualIdSource)), 'individualIdSource'] = 'LIBD_szControl'
+cmc_estimations = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/cmc_cell_prop.csv")
+cmc_estimations$dataset = rep("CMC", nrow(cmc_estimations))
+
+#Load single cell samples 
+psychencode_snCTPs = read_csv('/external/rprshnas01/netdata_kcni/stlab/cross_cohort_MGPs/psychencode_snCTPs.csv') 
+```
+
+Combine all data into a single df
+```{r}
+all_estimations = bind_rows(bind_rows(gvex_estimations, libd_estimations), cmc_estimations)
+all_estimations$primaryDiagnosis = factor(all_estimations$primaryDiagnosis, levels =c('control', "Bipolar Disorder", "Schizophrenia"))
+all_estimations = all_estimations %>% filter(!is.na(individualIdSource), !is.na(primaryDiagnosis),individualIdSource != 'BSHRI', ageDeath >= 20)
+
+
+
+#all_estimations = all_estimations %>% mutate(individualIdSource = recode(individualID, NA ="LIBD"))
+all_estimations_long = all_estimations %>% pivot_longer(cols = Astrocyte:VLMC, names_to = 'cell_type', values_to = 'rel_prop') 
+  
+```
+
+It appears that SMRI cohorts have very few subjects after filtering. Let's create a new column (new_study) that collapses SHMI cohorts back into GVEX, whilst keeping all other cohorts on their own. 
+```{r}
+new_study = all_estimations_long$individualIdSource 
+new_study[grepl("SMRI", new_study)] = "GVEX"
+all_estimations_long$newStudy = new_study %>% factor(levels = c("GVEX", "NIMH_HBCC","Pitt", "LIBD_szControl", "MSSM", "Penn"))
+```
+
+
+Model cell type proportion based on psychiatric diagnosis
+```{r}
+combined_lms = all_estimations_long %>% 
+  # group stacked data by cell_type
+  group_by(newStudy, cell_type) %>%
+  
+  # fit all the cell_type_prop data accorting to the model 
+  # using the broom package to tidy the results 
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) + scale(ageDeath)  +  scale(PMI) +
+               reportedGender + primaryDiagnosis ,  data = .))) %>%
+  
+  # unstack the data and adjust for multiple comparisons using the Benjamini-Hochberg method
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'BH')) %>%
+  #add cell class labels
+  mutate(class = case_when(
+    str_detect(cell_type, "Inh") ~ "Inhibitory",
+    str_detect(cell_type, "Exc") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal")) %>%
+  
+  # clean up the names the the term column
+  mutate(term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+                       `primaryDiagnosisBipolar Disorder` = "BP",
+                       `DxMDD` = "MDD",
+                       `scale(ageDeath)` = "Age",
+                       `scale(PMI..in.hours.)` = "PMI", 
+                       `scale(RIN)` = "RIN"))
+#Add study name for colour-coding
+combined_lms = merge(combined_lms, unique(all_estimations_long[c('dataset', "newStudy")]), by.x = "newStudy")
+combined_lms$newStudy = combined_lms$newStudy %>% factor(levels = c("GVEX", "NIMH_HBCC","Pitt", "LIBD_szControl", "MSSM", "Penn"))
+
+```
+
+Data visualization
+````{r, fig.height= 12, fig.width= 11}
+scz_plot_combined = combined_lms %>% 
+  filter(term %in% 'SCZ') %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = newStudy, y = estimate, fill = dataset)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ggtitle("Schizophrenia vs. Controls") +
+  ylab('Beta Coefficient') + 
+  xlab('Study') + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~cell_type, drop = T, scale = "free")
+scz_plot_combined
+```
+
+Based on the analysis above, it becomes clear that certain studies (MSSM/Penn) have a reduction in the effect of SCZ and BP on SST and PVALB cells whereas all other studies show an increase. This trend is observed elsewhere as well (VIP, LAMP5, L4_IT etc). We believe this discrepancy may be due to age-related changes in cell type proportion, whereby the negative correlation between cell type proportion and psychiatric diagnosis is masked by cell type proportion changes due to aging. Thus, the intuitive next step is to plot correlations between age and cell type proportion in each cohort. 
+
+```{r, fig.height= 8, fig.width= 4}
+#Plotting age at death against cell type proportion in each cohort 
+age_vs_cell_plot = all_estimations_long %>%
+  filter(cell_type %in% c('Inh_SST', "Inh_PVALB")) %>% 
+  ggplot(aes(x = ageDeath, y = rel_prop)) +
+  geom_point(colour = "grey", size = 0.4) +
+  geom_smooth(method = "lm", fullrange = T) +
+  stat_cor(size = 3, label.y.npc = "bottom") +
+  facet_grid(individualIdSource ~ cell_type) +
+  ggtitle("SST Cell Proportion vs. Age at Death") +
+  theme(panel.spacing = unit(.05, "lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = 1), 
+        strip.background = element_rect(color = "black", size = 1),
+        strip.text = element_text(size = 7))
+  
+age_vs_cell_plot
+
+#SST and PVALB cell proportions are negatively correlated with age at death in nearly all cohorts (this figure is also included in Sonny's aging paper)
+```
+
+
+```{r}
+#Create dataframe of mean age and RIN in each cohort and merge with linear model results
+avg_cohort_characteristics = all_estimations_long %>% 
+  group_by(newStudy) %>% 
+  summarize(avg_age = mean(ageDeath, na.rm = F))
+combined_lms = left_join(combined_lms, avg_cohort_characteristics)
+#Plot mean cohort age against beta estimates for diagnosis/cell proportion
+avg_age_vs_scz = combined_lms %>% 
+  filter(term == "SCZ", cell_type == "Inh_SST") %>%
+  ggplot(aes(x = avg_age, y = estimate)) +
+  geom_point() +
+  geom_smooth(method = "lm") + 
+  geom_text_repel(aes(label = newStudy)) + 
+  stat_cor()
+avg_age_vs_scz
+
+#As expected, MSSM and Penn have the oldest mean age at death, and are the only two cohorts with unexpected beta estimates for diagnosis vs. cell prop
+```
+
+AgeDeath vs. SST Proportion: We expect linear models to converge at higher ageDeath if cases/controls have a higher difference in SST number in younger samples. In other words, we hypothesize that as patients age, the effect of their diagnosis on SST proportion becomes weaker. 
+```{r}
+
+#Plot ageDeath vs. SST proportion for each cohort. 
+all_estimations %>% 
+  filter(primaryDiagnosis %in% c('control', 'Schizophrenia'), ageDeath > 20, individualIdSource != 'BSHRI') %>%
+  ggplot(aes(x = ageDeath, y = Inh_SST, color = primaryDiagnosis)) + 
+  geom_point(alpha = 0.5, size = 0.5) + 
+  #geom_smooth(se = F) + 
+  geom_smooth(se = F, method = 'lm', fullrange = T) + 
+  facet_wrap(~individualIdSource)
+
+#Only some results are as expected. Collapse cohorts back into studies (GVEX, LIBD, CMC) and try again.
+all_estimations %>% filter(primaryDiagnosis %in% c('control', 'Schizophrenia'), ageDeath > 20, individualIdSource != 'BSHRI') %>%
+  ggplot(aes(x = ageDeath, y = Inh_SST, color = primaryDiagnosis)) + 
+  geom_point(alpha = 0.5, size = 0.5) + 
+  #geom_smooth(se = F) + 
+  geom_smooth(se = F, method = "lm", fullrange = T) + 
+  facet_wrap(~contributingStudy)
+
+
+```
+
+New Models: As outlined above, there appears to be an interaction between age x diagnosis with respect to SST cell proportion. In other words, SST cell proportion is generally lower in SCZ patients, but declines faster with age in controls. To analyze this more clearly, we create new models (interaction_lms) to visualize this effect. These models include new_study as a covariate, and age x diagnosis as an interactor. 
+```{r}
+interaction_lms = all_estimations_long %>% 
+  # group stacked data by cell_type
+  group_by(newStudy, cell_type) %>%
+  
+  # fit all the cell_type_prop data accorting to the model 
+  # using the broom package to tidy the results 
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) + scale(ageDeath)  +  scale(PMI) +
+               reportedGender + primaryDiagnosis + scale(ageDeath) * primaryDiagnosis ,  data = .))) %>%
+  
+  # unstack the data and adjust for multiple comparisons using the Benjamini-Hochberg method
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'BH')) %>%
+  #add cell class labels
+  mutate(class = case_when(
+    str_detect(cell_type, "Inh") ~ "Inhibitory",
+    str_detect(cell_type, "Exc") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal")) %>%
+  
+  # clean up the names the the term column
+  mutate(term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+                       `primaryDiagnosisBipolar Disorder` = "BP",
+                       `scale(ageDeath):primaryDiagnosisSchizophrenia` = "Age x Diagnosis",
+                       `scale(ageDeath)` = "Age",
+                       `scale(PMI..in.hours.)` = "PMI", 
+                       `scale(RIN)` = "RIN"))
+#Add study name for colour-coding
+interaction_lms = merge(interaction_lms, unique(all_estimations_long[c('dataset', "newStudy")]), by.x = "newStudy")
+```
+
+Data visualization
+````{r, fig.height= 12, fig.width= 11}
+scz_plot_interaction = interaction_lms %>% 
+  filter(term %in% 'SCZ') %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = newStudy, y = estimate, fill = dataset)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ggtitle("Schizophrenia vs. Controls w/ Age x Diagnosis") +
+  ylab('Beta Coefficient') + 
+  xlab('Study') + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~cell_type, drop = T, scale = "free")
+scz_plot_interaction
+```
+
+NEXT STEPS: Meganalysis w/ all data and then stratify by age and plot beta coeffs by age group 
+```{r}
+#Meganalysis
+mega_lms = all_estimations_long %>% 
+  # group stacked data by cell_type
+  group_by(cell_type) %>%
+  
+  # fit all the cell_type_prop data accorting to the model 
+  # using the broom package to tidy the results 
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) + scale(ageDeath)  +  scale(PMI) +
+               reportedGender + primaryDiagnosis + newStudy + scale(ageDeath) * primaryDiagnosis ,  data = .))) %>%
+  
+  # unstack the data and adjust for multiple comparisons using the Benjamini-Hochberg method
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'BH')) %>%
+  #add cell class labels
+  mutate(class = case_when(
+    str_detect(cell_type, "Inh") ~ "Inhibitory",
+    str_detect(cell_type, "Exc") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal")) %>%
+  
+  # clean up the names the the term column
+  mutate(term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+                       `primaryDiagnosisBipolar Disorder` = "BP",
+                       `DxMDD` = "MDD",
+                       `scale(ageDeath)` = "Age",
+                       `scale(ageDeath):primaryDiagnosisSchizophrenia` = "Age x Diagnosis",
+                       `scale(PMI)` = "PMI", 
+                       `newStudyNIMH_HBCC` = "NIMH_HBCC",
+                       `newStudyPitt` = "Pitt",
+                       `newStudyMSSM` = "MSSM",
+                       `newStudyPenn` = "Penn",
+                       `scale(RIN)` = "RIN"))
+```
+
+````{r}
+scz_plot_mega = mega_lms %>% 
+  filter(term %in% 'SCZ') %>% 
+  ggplot(aes(x = cell_type, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ggtitle("Schizophrenia vs. Controls: Meganalysis") +
+  ylab('Beta Coefficient') + 
+  xlab('Study') + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+scz_plot_mega
+```
+
+Create age groups from age 20-90 in increments of 10 years. Plot meganalysis beta cooefs against age group.
+```{r}
+# Create function to map age to age range
+age_to_range <- function(age) {
+  lower_bound <- floor(age/10) * 10
+  upper_bound <- lower_bound + 9
+  paste0(lower_bound, "-", upper_bound)
+}
+
+# Apply function to age column to create age_range column
+all_estimations_long$age_range = sapply(all_estimations_long$ageDeath, age_to_range)
+
+#group cell_prop based on diagnosis in each age grouo
+#Meganalysis
+mega_lms_by_age = all_estimations_long %>% 
+  # group stacked data by cell_type
+  group_by(age_range, cell_type) %>%
+  
+  # fit all the cell_type_prop data accorting to the model 
+  # using the broom package to tidy the results 
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) +  scale(PMI) +
+               reportedGender + primaryDiagnosis + newStudy,  data = .))) %>%
+  
+  # unstack the data and adjust for multiple comparisons using the Benjamini-Hochberg method
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'BH')) %>%
+  #add cell class labels
+  mutate(class = case_when(
+    str_detect(cell_type, "Inh") ~ "Inhibitory",
+    str_detect(cell_type, "Exc") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal")) %>%
+  
+  # clean up the names the the term column
+  mutate(term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+                       `primaryDiagnosisBipolar Disorder` = "BP",
+                       `DxMDD` = "MDD",
+                       `scale(ageDeath)` = "Age",
+                       `scale(PMI)` = "PMI", 
+                       `newStudyNIMH_HBCC` = "NIMH_HBCC",
+                       `newStudyPitt` = "Pitt",
+                       `newStudyMSSM` = "MSSM",
+                       `newStudyPenn` = "Penn",
+                       `scale(RIN)` = "RIN"))
+
+```
+
+Visualize
+````{r, fig.height= 12, fig.width= 11}
+age_range_plot = mega_lms_by_age %>% 
+  filter(term %in% 'SCZ') %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_range, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ggtitle("Schizophrenia vs. Controls by Age Group") +
+  ylab('Beta Coefficient') + 
+  xlab('Age Range') + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~cell_type, drop = T, scale = "free")
+age_range_plot
+```
+
+--------------// Single Cell Time //--------------
+
+```{r}
+# Create function to map age to age range based on210% quantiles
+age_to_range_quantile <- function(age) {
+  quantiles = quantile(age, probs = seq(0.2, 1, 0.2))
+  range_vec = c()
+  for (i in 1:length(quantiles)) {
+    if (i == 1) {
+      range_vec[age <= quantiles[i]] <- paste0(0, "-", quantiles[i])
+    } else {
+      range_vec[age > quantiles[i-1] & age <= quantiles[i]] <- paste0(quantiles[i-1], "-", quantiles[i])
+    }
+  }
+  range_vec
+}
+
+# Create function to bin ages to >=70 and <70
+classify_ages <- function(ages) {
+  classifications <- ifelse(ages >= 70, "70+", "<70")
+  return(classifications)
+}
+
+```
+
+
+
+Let's perform a similar meganalysis on single cell data as validation. 
+```{r, fig.height= 12, fig.width= 11}
+snCTPs_long = psychencode_snCTPs %>% pivot_longer(cols = Astrocyte:VIP, names_to = 'cell_type', values_to = 'rel_prop')
+snCTPs_long$age_class = snCTPs_long$ageOfDeath %>% classify_ages() %>% factor()
+#Meganalysis
+ss_mega_lms_by_age = snCTPs_long %>% 
+  # group stacked data by cell_type
+  group_by(cell_type, age_class) %>%
+  # fit all the cell_type_prop data according to the model 
+  # using the broom package to tidy the results 
+  do(tidy(lm(scale(rel_prop) ~ scale(PMI) + Phenotype + Sex + Institution ,  data = .))) %>%
+  
+  # unstack the data and adjust for multiple comparisons using the Benjamini-Hochberg method
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'BH')) %>%
+  
+  mutate(term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `PhenotypeSZ` = "SCZ",
+                       `primaryDiagnosisBipolar Disorder` = "BP",
+                       `DxMDD` = "MDD",
+                       `scale(ageDeath)` = "Age",
+                       `scale(PMI)` = "PMI", 
+                       `newStudyNIMH_HBCC` = "NIMH_HBCC",
+                       `newStudyPitt` = "Pitt",
+                       `newStudyMSSM` = "MSSM",
+                       `newStudyPenn` = "Penn",
+                       `scale(RIN)` = "RIN"))
+
+ss_age_range_plot = ss_mega_lms_by_age %>% 
+  filter(term %in% 'SCZ') %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_class, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ggtitle("Single Nucleus: Schizophrenia vs. Controls by Age Group") +
+  ylab('Beta Coefficient') + 
+  xlab('Age Range') + 
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  facet_wrap(~cell_type, drop = T, scale = "free")
+ss_age_range_plot
+```
+
+--------------// Microscopy Time //--------------
+
+```{r}
+### SIBILLE LAB CELL DENSITIES 
+
+#import etienne's lab's cell fraction estimates
+sibille_lab_cell_props = readxl::read_excel('/external/rprshnas01/netdata_kcni/stlab/etienne_rnaseq_processed/full cell counts(Excel).xlsx')
+sibille_lab_cell_props$PYR = sibille_lab_cell_props$PYR_23 + sibille_lab_cell_props$PYR_56 
+
+# this is the tetrad metadata
+tetrad_path = '/external/rprshnas01/netdata_kcni/stlab/Collaborators/Sibille/RNAseq_processed/'
+
+tetrad_meta = read_csv(paste0(tetrad_path, "pTable with correct med info.csv"))
+tetrad_meta$sample_names = str_sub(tetrad_meta$X, end=-5) %>% make.names()
+tetrad_meta$sample_names =  gsub("_", ".", tetrad_meta$sample_names)
+
+tetrad_meta = tetrad_meta %>% mutate(Subject = HU., 
+                       Reported.Gender = case_when(Sex == "M" ~"Male",
+                                                   Sex == "F" ~ "Female"),
+                       Age_norm = Age, 
+                       PMI..in.hours. = PMI)
+
+microCTPs = left_join(sibille_lab_cell_props, tetrad_meta)
+microCTPs_long =  microCTPs %>% pivot_longer(cols = PV:PYR, names_to = 'cell_type', values_to = 'rel_prop')
+```
+
+Model Microscopy CTPs
+```{r}
+microCTPs_long$age_range = microCTPs_long$Age %>% age_to_range_quantile() %>% factor()
+microCTPs_long$Subject.Group = microCTPs_long$Subject.Group %>% factor(levels = c("Control", "SCHIZ", "MDD", "Bipolar"))
+#Meganalysis
+micro_mega_lms_by_age = microCTPs_long %>% 
+  # group stacked data by cell_type
+  group_by(cell_type, age_range) %>%
+  # fit all the cell_type_prop data according to the model 
+  # using the broom package to tidy the results 
+  do(tidy(lm(scale(rel_prop) ~ scale(PMI) + Subject.Group + Sex ,  data = .))) %>%
+  
+  # unstack the data and adjust for multiple comparisons using the Benjamini-Hochberg method
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'BH')) %>%
+   mutate(term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `scale(PMI)` = "PMI", 
+                       `Subject.GroupControl` = "Control",
+                       `Subject.GroupSCHIZ`= "SCZ",
+                       `SexM` = "Sex"))
+
+micro_age_range_plot = micro_mega_lms_by_age %>% 
+  filter(term %in% 'SCZ') %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_range, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ggtitle("Microscopy: Schizophrenia vs. Controls by Age Group") +
+  ylab('Beta Coefficient') + 
+  xlab('Age Range') + 
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  facet_wrap(~cell_type, drop = T, scale = "free")
+micro_age_range_plot
+```
+
+
+
+
+
+--------------// Big Ole Figures Time //--------------
+
+Figure 1: Illustrating the association between cell prop and diagnosis and cohort specific differences.
+```{r, fig.height=13, fig.width=10 }
+#Figure 1a: Results from SCZ meganalysis stratified by cell class
+significant_mega = subset(mega_lms, padj <= 0.05 & term == "SCZ")
+significant_mega$asterisks = ifelse(significant_mega$padj <= 0.001, "***",
+                                   ifelse(significant_mega$padj <= 0.01, "**", "*"))
+significant_mega$vjust = ifelse(significant_mega$estimate >= 0, -3, 3.5)
+
+figure_1a = mega_lms %>% 
+  filter(term %in% 'SCZ') %>% 
+  ggplot(aes(x = cell_type, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  facet_grid(~class, drop = T, scale = "free_x", space = "free") +
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ylab('Beta Coefficient') + 
+  xlab('Cell Type') + 
+  geom_text(data = significant_mega,
+            aes(cell_type, estimate, label = asterisks), 
+            vjust = significant_mega$vjust) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust= 1, size = 13), 
+    axis.title.x = element_text(vjust = 6, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  guides(fill = FALSE) +
+  scale_y_continuous(limits = c(-0.25, 0.42))
+
+#Figure 1b: Cohort-specific beta values in SST, PVALB, VIP(?)
+#Add meganalysis data to combined_lms
+mega = mega_lms %>% filter(term == 'SCZ', cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP"))
+mega$newStudy = rep("All", nrow(mega))
+mega$dataset = rep("All", nrow(mega))
+mega$avg_age = rep(NA, nrow(mega))
+combined_lms = rbind(combined_lms, mega)
+combined_lms$newStudy = combined_lms$newStudy %>% factor(levels = c("GVEX", "NIMH_HBCC","Pitt", "LIBD_szControl", "MSSM", "Penn","All"))
+
+significant_combined = subset(combined_lms, padj < 0.05 & cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP") & term == "SCZ")
+significant_combined$asterisks <- ifelse(significant_combined$padj <= 0.001, "***",
+                                   ifelse(significant_combined$padj <= 0.01, "**", "*"))
+significant_combined$vjust = ifelse(significant_combined$estimate >= 0, -3, 4)
+
+figure_1b = combined_lms %>% 
+  filter(term == 'SCZ', cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP")) %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = newStudy, y = estimate, fill = newStudy)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ylab('Beta Coefficient') + 
+  xlab('') +
+  scale_fill_manual(values=cbPalette) +
+  geom_text(data = significant_combined,
+            aes(newStudy, estimate, label = asterisks), 
+            vjust = significant_combined$vjust) +
+   theme(
+     axis.text.x = element_blank(),
+     axis.title.x = element_text(vjust = 6, size = 16),
+     axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16),
+    legend.position = "bottom",
+    legend.title = element_blank()) +
+  facet_grid(~cell_type, drop = T, scale = "free_x", space = "free") +
+  guides(fill = guide_legend(nrow = 1)) +
+  scale_y_continuous(limits = c(-1, 0.7))
+
+#Figure 1c: Raw MGPs vs. Diagnosis
+figure_1c = all_estimations_long %>%
+  filter(primaryDiagnosis %in% c('Schizophrenia', "control"), cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP")) %>%
+  ggplot(aes(x = primaryDiagnosis, y = rel_prop)) +
+  geom_boxplot(outlier.shape = NA, aes(fill = newStudy, alpha = 0.5), show.legend = F, notch = T) +
+  geom_beeswarm(size = 1, alpha = 0.3, aes(colour = newStudy), show.legend = F) +
+  ylab('Relative Cell Prop.') + 
+  xlab('Diagnosis') + 
+  scale_x_discrete(labels=c("C", "SCZ")) +
+  scale_colour_manual(values = cbPalette,) +
+  scale_fill_manual(values = cbPalette,) +
+  theme(
+     axis.text.x = element_text(size = 13),
+     axis.title.x = element_text(vjust = -2, size = 16),
+     axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 14)) +
+  guides(fill = FALSE) +
+  facet_grid(rows = vars(cell_type), cols = vars(newStudy), drop = T, scale = "free", switch = "y", space = "free") +
+  geom_signif(comparisons = list(c("control","Schizophrenia")),map_signif_level = TRUE) +
+  scale_y_continuous(limits = c(-3.5, 3.5)) 
+
+#Combine Figure 1
+figure_1 = figure_1b / figure_1c
+figure_1 + plot_annotation(tag_levels = 'A') + plot_layout(heights = c(1,1.5)) & theme(plot.tag = element_text(size = 25))
+```
+
+Figure 2: Introducing and presenting an interaction between age and diagnosis w/rt cell proportion.
+```{r, fig.height=13, fig.width=10}
+#Plot interaction beta values from meganalysis
+significant_mega <- subset(mega_lms, padj <= 0.05 & term == "Age x Diagnosis")
+significant_mega$asterisks <- ifelse(significant_mega$padj <= 0.001, "***",
+                                   ifelse(significant_mega$padj <= 0.01, "**", "*"))
+significant_mega$vjust = ifelse(significant_mega$estimate >= 0, -3, 3)
+#Figure 2a: Results from interaction meganalysis stratified by cell class - plot interaction beta coeff
+figure_2a = mega_lms %>% 
+  filter(term %in% 'Age x Diagnosis') %>% 
+  ggplot(aes(x = cell_type, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  facet_grid(~class, drop = T, scale = "free_x", space = "free") +
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ylab('Interaction Coefficient') + 
+  xlab('Cell Type') + 
+  geom_text(data = significant_mega,
+            aes(cell_type, estimate, label = asterisks), 
+            vjust = significant_mega$vjust) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust= 1, size = 13), 
+    axis.title.x = element_text(vjust = 8, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  guides(fill = FALSE) +
+  scale_y_continuous(limits = c(-0.15, 0.32))
+
+#Figure 2b: Plot beta values from meganalysis in 10-year age bind for SST, PVALB, VIP
+significant_mega_age <- subset(mega_lms_by_age, p.value <= 0.05 & term == "SCZ" & cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP"))
+significant_mega_age$asterisks <- ifelse(significant_mega_age$p.value <= 0.001, "***",
+                                   ifelse(significant_mega_age$p.value <= 0.01, "**", "*"))
+significant_mega_age$vjust = ifelse(significant_mega_age$estimate >= 0, -4, 4)
+
+figure_2b = mega_lms_by_age %>% 
+  filter(term %in% 'SCZ' & cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP")) %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_range, y = estimate, fill = cell_type)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ylab('Beta Coefficient') + 
+  xlab('\n \n Age Range') + 
+  geom_text(data = significant_mega_age,
+            aes(age_range, estimate, label = asterisks), 
+            vjust = significant_mega_age$vjust) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust= 1, size = 13), 
+    axis.title.x = element_text(vjust = 8, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  facet_wrap(~cell_type, drop = T, scale = "free_x") +
+    guides(fill = FALSE) +
+  scale_y_continuous(limits = c(-1.0, 1.4 ))
+
+#Add residuals to all_estimations_long
+res_model = lm(scale(rel_prop) ~ scale(RIN) + scale(PMI) + reportedGender,  data = all_estimations_long)
+all_estimations_long = all_estimations_long %>% add_residuals(var = "resid", model = res_model)
+#Figure 2c: Visualizing interaction between age and diagnosis by plotting rel_prop vs. age in each diagnosis 
+figure_2c = all_estimations_long %>%
+  filter(primaryDiagnosis %in% c('Schizophrenia', "control"), cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP")) %>%
+  ggplot(aes(x = ageDeath, y = rel_prop, color = primaryDiagnosis)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = F, method = 'lm', fullrange = T) +
+  scale_colour_hue(labels=c("Control", "SCZ")) +
+  ylab('Relative Cell Prop.') + 
+  xlab('Age') + 
+  theme(
+     axis.text.x = element_text(size = 13),
+     axis.title.x = element_text(vjust = -2, size = 16),
+     axis.title.y = element_text(size = 16),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    strip.text.x = element_text(size = 16)) +
+  facet_grid(~cell_type, drop = T, scale = "free_x", space = "free") +
+  guides(fill = guide_legend(nrow = 1))
+  
+
+figure_2 = figure_2b / figure_2c / figure_2a
+figure_2 + plot_annotation(tag_levels = 'A') + plot_layout(heights = c(1,0.9,1)) & theme(plot.tag = element_text(size = 25))
+
+```
+
+Figure 3: Validating trends and interactions in ssRNAseq 
+```{r}
+#Figure 3a: ssRNAseq cell proportions binned by 20% age quantile
+#Note: no Pvalues are significant
+figure_3a = ss_mega_lms_by_age %>% 
+  filter(term %in% 'SCZ' & cell_type %in% c("SST", "PVALB", "VIP")) %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_class, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ylab('Beta Coefficient') + 
+  xlab('Age Range (20% quantiles)') + 
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  facet_wrap(~cell_type, drop = T, scale = "free")
+
+
+
+figure_3 = figure_3a
+figure_3 + plot_annotation(tag_levels = 'A') + plot_layout(heights = c(1)) & theme(plot.tag = element_text(size = 25))
+
+```
+
+Figure 4: Validating trends and interactions in microscopy data
+```{r}
+#Figure 4a: Microscopy cell proportions binned by 20% age quantile
+significant_micro <- subset(micro_mega_lms_by_age, padj <= 0.05 & term == "SCZ" & cell_type %in% c("SST", "PV", "VIP"))
+significant_micro$asterisks <- ifelse(significant_micro$padj <= 0.001, "***",
+                                   ifelse(significant_micro$padj <= 0.01, "**", "*"))
+significant_micro$vjust = ifelse(significant_micro$estimate >= 0, -2, 4)
+
+figure_4a = micro_mega_lms_by_age %>% 
+  filter(term %in% 'SCZ' & cell_type %in% c("SST", "PV", "VIP")) %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_range, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ylab('Beta Coefficient') + 
+  xlab('Age Group)') + 
+   geom_text(data = significant_micro,
+            aes(age_range, estimate, label = asterisks), 
+            vjust = significant_micro$vjust) +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  facet_wrap(~cell_type, drop = T, scale = "free") +
+  scale_y_continuous(limits = c(-2.7, 1.7))
+
+figure_4 = figure_4a
+figure_4 + plot_annotation(tag_levels = 'A') + plot_layout(heights = c(1)) & theme(plot.tag = element_text(size = 25))
+
+```
+
+
+Next Steps:
+-Split newStudy into >/< 70 and plot age vs cell prop - calculate interaction terms (quantiles maybe?)
+-Analyze scRNAseq data /external/rprshnas01/netdata_kcni/stlab/cross_cohort_MGPs/psychencode_snCTPs.csv
+-Hypothesis: BD replicates SCZ but to a lesser degree (add BipSeq)
+-Clean code 
+-Sliiiides <3 
+-Plotgrid/patchwork -> multi-panel figures 
+

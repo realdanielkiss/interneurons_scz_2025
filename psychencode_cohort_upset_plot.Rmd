@@ -1,0 +1,194 @@
+---
+title: "psychencode_cohort_upset_plot"
+author: "Daniel Kiss"
+date: "3/19/2025"
+output: html_document
+---
+
+Packages etc.
+```{r}
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library(markerGeneProfile) 
+library(matrixStats)
+library(cowplot) 
+library(broom)
+library(knitr)
+library(ggpubr)
+library(ggrepel)
+library(patchwork)
+library(ggsignif)
+library(modelr)
+library(ggbeeswarm)
+library(lemon)
+library(UpSetR)
+theme_set(theme_classic2())
+#Colour palette
+cbPalette = c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+
+Load Bulk Data
+```{r}
+#Cell type proportions for each data set merged with metadata - ready for modelling 
+mgp_estimations = read_csv( "/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/psychencode_mgp_estimations.csv") 
+acc_estimations = read_csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/cmc_acc_mgp_estimations.csv") %>% filter(primaryDiagnosis %in% c("control", "Schizophrenia"))
+#Factorize newStudy for aesthetic purposes (this orderl ooks good on graphs)
+mgp_estimations = mgp_estimations %>% filter(ageDeath >= 15)
+mgp_estimations$newStudy = mgp_estimations$newStudy %>% factor(levels = c("Pitt", "GVEX", "NIMH_HBCC", "LIBD_szControl", "MSSM", "Penn"))
+
+```
+
+Load single cell data
+```{r}
+psychencode_snCTPs = read.csv('/external/rprshnas01/netdata_kcni/stlab/Xiaolin/cell_deconv_data/PsychEncode_label_transferred_snCTP.csv')
+snCTP_metadata = read.csv("~/cell_prop_psychiatry/data/psychencode_label_transferred_pseudobulk_metadata.csv")[,-1] %>%
+  group_by(ID) %>%
+  mutate(total_cells = sum(num_cells)) %>%
+  ungroup() 
+#Add log10 number of cells variable
+snCTP_metadata$log10_num_cells = log10(snCTP_metadata$num_cells)
+#Add age group variable
+snCTP_metadata =  snCTP_metadata %>%
+  mutate(age_group = case_when(
+    Age < 70 ~ "Under_70", Age >= 70 ~ "Over_70")) 
+snCTP_metadata$age_group = snCTP_metadata$age_group %>% factor(levels = c("Under_70", "Over_70"))
+psychencode_snCTPs = left_join(snCTP_metadata, psychencode_snCTPs) 
+
+psychencode_snCTPs = psychencode_snCTPs %>%  
+  distinct(unique_donor_ID, .keep_all = T)
+
+psychencode_snCTPs$individualID = ifelse(
+  !is.na(psychencode_snCTPs$CMC_ID), 
+  paste("CMC_", psychencode_snCTPs$CMC_ID, sep = ""),
+  paste("McLean_", psychencode_snCTPs$ID, sep = "")
+)
+```
+
+Load LCMseq data
+```{r}
+#Load Sibille Lab microscopy
+sibille_lab_cell_props = sibille_lab_cell_fractions = read_csv('/external/rprshnas01/netdata_kcni/stlab/cross_cohort_MGPs/sibille_lab_cell_fractions.csv') %>% filter(Subject.Group %in% c("Control", "SCHIZ")) %>% distinct()
+
+# this is the tetrad metadata
+tetrad_path = '/external/rprshnas01/netdata_kcni/stlab/Collaborators/Sibille/RNAseq_processed/'
+tetrad_meta = read_csv(paste0(tetrad_path, "pTable with correct med info.csv"))
+tetrad_meta$sample_names = str_sub(tetrad_meta$X, end=-5) %>% make.names()
+tetrad_meta$sample_names =  gsub("_", ".", tetrad_meta$sample_names)
+tetrad_meta = tetrad_meta %>% mutate(Subject = HU., 
+                       Reported.Gender = case_when(Sex == "M" ~"Male",
+                                                   Sex == "F" ~ "Female"),
+                       Age_norm = Age, 
+                       PMI..in.hours. = PMI) %>% filter(Cell.Type == "SST")
+
+microCTPs = left_join(sibille_lab_cell_props, tetrad_meta) %>% filter(Subject != 1367)
+microCTPs$individualID = microCTPs$Individual.ID
+
+microCTPs <- microCTPs %>%
+  mutate(individualID = ifelse(is.na(individualID), Subject, individualID))
+
+```
+
+Create consolidated df for plotting
+```{r}
+# For mgp_estimations and acc_estimations
+mgp_estimations_filtered <- mgp_estimations %>%
+  select(individualID, primaryDiagnosis) %>%
+  mutate(cohort = mgp_estimations$newStudy,
+         dataType = "bulk",
+         brainArea = "DLPFC")
+
+acc_estimations_filtered <- acc_estimations %>%
+  select(individualID, primaryDiagnosis) %>%
+  mutate(cohort = str_remove(acc_estimations$newStudy, "_ACC$"),
+         dataType = "bulk",
+         brainArea = "ACC")
+
+# For psychencode_snCTPs
+psychencode_snCTPs_filtered <- psychencode_snCTPs %>%
+  select(individualID, Phenotype) %>%
+  mutate(cohort = recode(psychencode_snCTPs$Institution, "McLean" = "Mclean", "MtSinai" = "MSSM"),
+         dataType = "snRNAseq",
+         brainArea = "DLPFC")
+
+# For microCTPs
+microCTPs_filtered <- microCTPs %>%
+  select(individualID, Subject.Group) %>%
+  mutate(cohort = "Pitt",
+         dataType = "FISH+LCMseq",
+         brainArea = "sgACC")
+
+# Combine all datasets into one dataframe
+all_subjects <- bind_rows(mgp_estimations_filtered, acc_estimations_filtered, psychencode_snCTPs_filtered, microCTPs_filtered)
+```
+
+
+Plot overlap between cohorts
+```{r, fig.height = 4, fig.width = 5}
+
+batiuk_df <- tibble(
+  individualID = paste0("Batiuk_",   seq_len(23)),   # 23 donors
+  cohort       = "Batiuk",
+  brainArea    = "DLPFC",    # <- change if the samples are ACC / sgACC
+  dataType     = "snRNAseq"  # <- change if the assay is different
+)
+
+gerstner_df <- tibble(
+  individualID = paste0("Gerstner_", seq_len(69)),   # 69 donors
+  cohort       = "Gerstner",
+  brainArea    = "DLPFC",
+  dataType     = "snRNAseq"
+)
+
+# 2.  Bind them onto the existing table …
+all_subjects <- bind_rows(all_subjects, batiuk_df, gerstner_df)
+
+# 3.  … and reset the factor levels exactly as you asked
+all_subjects <- all_subjects %>%
+  mutate(
+    cohort    = factor(cohort,
+                       levels = c("Gerstner", "Batiuk", "Mclean", "Penn",
+                                  "MSSM", "LIBD_szControl", "NIMH_HBCC",
+                                  "GVEX", "Pitt")),
+    brainArea = factor(brainArea,  levels = c("sgACC", "ACC", "DLPFC")),
+    dataType  = factor(dataType,   levels = c("FISH+LCMseq", "snRNAseq", "bulk"))
+  )
+
+all_subjects <- all_subjects %>%
+  mutate(cohort_brain_data = paste(cohort, brainArea, dataType, sep = " / ")) %>%
+  
+# Convert to a factor using the distinct combinations in the order we want
+  mutate(cohort_brain_data = factor(
+    cohort_brain_data,
+    levels = all_subjects %>%
+      distinct(cohort, brainArea, dataType) %>%
+      arrange(cohort, brainArea, dataType) %>%
+      mutate(x = paste(cohort, brainArea, dataType, sep = " / ")) %>%
+      pull(x)
+  ))
+
+#Group, summarize, and arrange by the factor before converting to a list
+cohort_list <- all_subjects %>%
+  group_by(cohort_brain_data) %>%
+  summarise(individualIDs = list(unique(individualID)), .groups = "drop") %>%
+  arrange(cohort_brain_data) %>%  # Ensure rows match the factor's order
+  deframe()                       
+
+#Create the upset plot with the custom order
+upset = upset(fromList(cohort_list), 
+      sets = names(cohort_list),  # Use the custom ordered names of the sets
+      sets.bar.color = "navy", 
+      order.by = "degree", 
+      main.bar.color = "black",  
+      matrix.color = "firebrick",  
+      keep.order = T,
+      mainbar.y.label = "Number of Shared Individuals",
+      text.scale = c(1.4,1.4,1.4,1,1,1.4),
+      point.size = 3,
+      line.size = 1,
+      set_size.scale_max = 500,
+      set_size.show = TRUE)  # Show set sizes
+upset
+
+```

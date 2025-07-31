@@ -1,0 +1,118 @@
+---
+title: "Untitled"
+author: "Daniel Kiss"
+date: "11/6/2023"
+output: html_document
+---
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(Seurat)
+  library(edgeR)
+  library(ggrepel)
+  library(cowplot)
+  library(limma)
+  library(ggpubr)
+  library(gprofiler2)
+  library(EnhancedVolcano)
+  library(patchwork)
+})
+theme_set(theme_classic2())
+#Colour palette
+cbPalette <- c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+
+Load Data // Define Variables
+```{r}
+pseudobulk = read.delim("/external/rprshnas01/netdata_kcni/stlab/SZBDMulticohort/pseudobulk_fine_grained.counts.tsv")
+pseudobulk_metadata = read.delim("/external/rprshnas01/netdata_kcni/stlab/SZBDMulticohort/pseudobulk_fine_grained.metadata.tsv")
+CELL_TYPES = pseudobulk_metadata$Celltype %>% unique()
+```
+
+Define Subjects
+```{r}
+USE_COHORT = 'MtSinai'
+NUM_CELLS = 20
+
+SST_SCZ = pseudobulk_metadata %>% filter(Celltype == "In-SST", Cohort == USE_COHORT, num_cells > NUM_CELLS, Phenotype == "SZ") %>% pull(unique_donor_ID)
+SST_CON = pseudobulk_metadata %>% filter(Celltype == "In-SST", Cohort == USE_COHORT, num_cells > NUM_CELLS, Phenotype == "CON") %>% pull(unique_donor_ID)
+PVALB_SCZ = pseudobulk_metadata %>% filter(Celltype == "In-PV_Basket", Cohort == USE_COHORT, num_cells > NUM_CELLS, Phenotype == "SZ") %>% pull(unique_donor_ID)
+PVALB_CON = pseudobulk_metadata %>% filter(Celltype == "In-PV_Basket", Cohort == USE_COHORT, num_cells > NUM_CELLS, Phenotype == "CON") %>% pull(unique_donor_ID)
+
+```
+
+Subset count matrices and convert to cpm
+```{r}
+sst_scz_counts = pseudobulk %>% filter(unique_donor_ID %in% SST_SCZ,  Celltype == "In-SST") 
+sst_scz_counts = sst_scz_counts[, 3:ncol(sst_scz_counts)] %>% t() %>% cpm() %>% t() %>% as.data.frame()
+rownames(sst_scz_counts) = SST_SCZ
+  
+sst_con_counts = pseudobulk %>% filter(unique_donor_ID %in% SST_CON,  Celltype == "In-SST") 
+sst_con_counts = sst_con_counts[, 3:ncol(sst_con_counts)] %>% t() %>% cpm() %>% t() %>% as.data.frame()
+rownames(sst_con_counts) = SST_CON
+  
+pvalb_scz_counts = pseudobulk %>% filter(unique_donor_ID %in% PVALB_SCZ,  Celltype == "In-PV_Basket") 
+pvalb_scz_counts = pvalb_scz_counts[, 3:ncol(pvalb_scz_counts)] %>% t()%>% cpm() %>% t() %>% as.data.frame()
+rownames(pvalb_scz_counts) = PVALB_SCZ
+  
+pvalb_con_counts = pseudobulk %>% filter(unique_donor_ID %in% PVALB_CON, Celltype == "In-PV_Basket")
+pvalb_con_counts = pvalb_con_counts[, 3:ncol(pvalb_con_counts)] %>% t() %>% cpm() %>% t() %>% as.data.frame()
+rownames(pvalb_con_counts) = PVALB_CON
+```
+
+Create a data frame with expression data for SST and PVALB mRNA
+```{r}
+counts_for_plot = data.frame(
+  cell_type = rep(c("In-SST", "In-PVALB"),
+                  c((length(SST_SCZ) + length(SST_CON)), 
+                    (length(PVALB_SCZ) + length(PVALB_CON)))),
+  phenotype = rep(c("SCZ", "CON", "SCZ", "CON"),
+                  c(length(SST_SCZ), length(SST_CON), length(PVALB_SCZ), length(PVALB_CON))),
+  cpm = c(sst_scz_counts$SST, sst_con_counts$SST, pvalb_scz_counts$PVALB, pvalb_con_counts$PVALB)
+)
+```
+
+Plot data from above
+```{r}
+p1 = counts_for_plot %>% filter(cell_type == "In-PVALB") %>%
+  ggplot(aes(x = phenotype, y = cpm)) +
+  geom_boxplot(aes(alpha = 0.5), show.legend = F) + 
+  facet_grid(cols = vars(cell_type)) +
+  geom_signif(comparisons = list(c("CON", "SCZ")), map_signif_level = TRUE)
+
+p2 = counts_for_plot %>% filter(cell_type == "In-SST") %>%
+  ggplot(aes(x = phenotype, y = cpm)) +
+  geom_boxplot(aes(alpha = 0.5), show.legend = F) + 
+  facet_grid(cols = vars(cell_type)) +
+  geom_signif(comparisons = list(c("CON", "SCZ")), map_signif_level = TRUE)
+
+p1 +p2
+
+```
+
+
+figure_1c <- all_estimations_long %>%
+  filter(primaryDiagnosis %in% c('Schizophrenia', "control"), cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP")) %>%
+  ggplot(aes(x = primaryDiagnosis, y = rel_prop)) +
+  geom_boxplot(outlier.shape = NA, aes(fill = newStudy, alpha = 0.5), show.legend = F, notch = T) +
+  geom_beeswarm(size = 1, alpha = 0.3, aes(colour = newStudy), show.legend = F) +
+  ylab('Relative Cell Prop.') + 
+  xlab('Diagnosis') + 
+  scale_x_discrete(labels = c("C", "SCZ")) +
+  scale_colour_manual(values = cbPalette) +
+  scale_fill_manual(values = cbPalette) +
+  theme(
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(vjust = -2, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 14)) +
+  guides(fill = FALSE) +
+  facet_grid(rows = vars(cell_type), cols = vars(newStudy), drop = T, scale = "free", switch = "y", space = "free") +
+  geom_signif(comparisons = list(c("control", "Schizophrenia")), map_signif_level = TRUE) +
+  scale_y_continuous(limits = c(-3.5, 3.5)) 
+
+

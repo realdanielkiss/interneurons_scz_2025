@@ -1,0 +1,318 @@
+---
+title: "Figure_S8_Suic"
+author: "Daniel Kiss"
+date: "5/26/2025"
+output: html_document
+---
+
+Packages etc.
+```{r}
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library(markerGeneProfile) 
+library(matrixStats)
+library(cowplot) 
+library(broom)
+library(knitr)
+library(ggpubr)
+library(ggrepel)
+library(patchwork)
+library(ggsignif)
+library(modelr)
+library(ggbeeswarm)
+library(lemon)
+theme_set(theme_classic2())
+#Colour palette
+cbPalette = c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+
+```{r}
+#Cell type proportions for each data set merged with metadata - ready for modelling 
+mgp_estimations = read_csv( "/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/psychencode_mgp_estimations.csv") 
+
+#Factorize newStudy for aesthetic purposes (this orderl ooks good on graphs)
+mgp_estimations = mgp_estimations %>% filter(ageDeath >= 15)
+mgp_estimations$newStudy = mgp_estimations$newStudy %>% factor(levels = c("GVEX", "LIBD_szControl"))
+mgp_estimations = mgp_estimations %>%
+  mutate(causeDeathSuic = ifelse(grepl("suic", causeDeath, ignore.case = TRUE), "suicide", "other")) %>%
+  dplyr::mutate(causeDeathSuic = factor(causeDeathSuic, levels = c("suicide", "other")))
+
+mgp_estimations_long = mgp_estimations %>% pivot_longer(cols = Astrocyte:VLMC, names_to = 'cell_type', values_to = 'rel_prop') %>%
+  mutate(cell_class = case_when(
+    cell_type %in% c( "PVALB", "SST", "VIP", "LAMP5", "PAX6") ~ "Inhibitory",
+    cell_type %in% c("IT", "L4.IT", "L5.ET", "L5.6.IT.Car3", "L5.6.NP", "L6.CT", "L6b") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal"
+  ))
+mgp_estimations_long$cell_type = mgp_estimations_long$cell_type %>% factor(levels = c("PVALB", "SST", "VIP", "LAMP5", "PAX6", "IT", "L4.IT", "L5.ET", "L5.6.IT.Car3", "L5.6.NP", "L6.CT", "L6b", "Astrocyte", "Endothelial", "Microglia", "Oligodendrocyte", "OPC", "Pericyte", "VLMC"))
+mgp_estimations_long$cell_class = mgp_estimations_long$cell_class %>% factor(levels = c("Inhibitory", "Excitatory", "Non-Neuronal"))
+```
+
+
+```{r}
+mgp_suicide = mgp_estimations %>% filter(newStudy %in% c("LIBD_szControl", "GVEX"), causeDeathSuic == 'other')
+mgp_suicide_long = mgp_suicide %>% pivot_longer(cols = Astrocyte:VLMC, names_to = 'cell_type', values_to = 'rel_prop') %>%
+  mutate(cell_class = case_when(
+    cell_type %in% c( "PVALB", "SST", "VIP", "LAMP5", "PAX6") ~ "Inhibitory",
+    cell_type %in% c("IT", "L4.IT", "L5.ET", "L5.6.IT.Car3", "L5.6.NP", "L6.CT", "L6b") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal"
+  ))
+mgp_suicide_long$cell_type = mgp_suicide_long$cell_type %>% factor(levels = c("PVALB", "SST", "VIP", "LAMP5", "PAX6", "IT", "L4.IT", "L5.ET", "L5.6.IT.Car3", "L5.6.NP", "L6.CT", "L6b", "Astrocyte", "Endothelial", "Microglia", "Oligodendrocyte", "OPC", "Pericyte", "VLMC"))
+mgp_suicide_long$cell_class = mgp_suicide_long$cell_class %>% factor(levels = c("Inhibitory", "Excitatory", "Non-Neuronal"))
+
+```
+
+
+Residualize MGPs based on linear model
+```{r}
+mgp_suicide_long = mgp_suicide_long %>%
+  group_by(cell_type) %>%
+  mutate(resid = resid(lm(scale(rel_prop) ~ scale(RIN) + scale(ageDeath) + scale(PMI) + 
+                reportedGender))) %>%
+  ungroup()
+```
+
+Model rCTPs based on diagnosis and covariates seperately in each cohort
+```{r}
+combined_lms = mgp_suicide_long %>%
+  group_by(newStudy, cell_type) %>%
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) + scale(ageDeath) + scale(PMI) +
+               reportedGender + primaryDiagnosis, data = .))) %>%
+  ungroup() %>%
+  mutate(padj = p.adjust(p.value, method = 'fdr'),
+         term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+                       `scale(ageDeath)` = "Age",
+                       `scale(PMI)` = "PMI",
+                       `scale(RIN)` = "RIN")) %>%
+  merge(unique(mgp_suicide_long[c('dataset', 'newStudy')]), by.x = "newStudy") %>%
+  merge(unique(mgp_suicide_long[c('cell_class', 'cell_type')]), by.x = "cell_type") %>%
+  mutate(newStudy = factor(newStudy, levels = c("Pitt", "GVEX", "NIMH_HBCC", "LIBD_szControl", "MSSM", "Penn")))
+```
+
+Interaction mega-analysis w/ all data 
+```{r}
+mega_lms = mgp_suicide_long %>% 
+  group_by(cell_type) %>%
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) + scale(ageDeath) + scale(PMI) +
+             reportedGender + primaryDiagnosis + newStudy + scale(ageDeath)*primaryDiagnosis, data = .))) %>%
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'fdr'),
+         term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+
+                       `scale(ageDeath)` = "Age",
+                       `scale(ageDeath):primaryDiagnosisSchizophrenia` = "Age x Diagnosis",
+                       `scale(PMI)` = "PMI", 
+                       `newStudyNIMH_HBCC` = "NIMH_HBCC",
+                       `newStudyLIBD_szControl` = "LIBD_szControl",
+                       `newStudyPitt` = "Pitt",
+                       `newStudyMSSM` = "MSSM",
+                       `newStudyPenn` = "Penn",
+                       `scale(RIN)` = "RIN")) %>%
+  merge(unique(mgp_estimations_long[c('cell_class', 'cell_type')]), by.x = "cell_type") 
+```
+
+Plotting causeDeath vs. ageDeath - reviewer 3
+-Color code or different shapes for diagnosis on thi plot
+```{r, fig.height= 4, fig.width= 4}
+mgp_estimations <- mgp_estimations %>%
+  mutate(causeDeathSuic = ifelse(grepl("suic", causeDeath, ignore.case = TRUE), "suicide", "other")) %>%
+  dplyr::mutate(causeDeathSuic = factor(causeDeathSuic, levels = c("suicide", "other")))
+
+panel_A = mgp_estimations %>% 
+  filter(!is.na(causeDeathSuic), newStudy %in% c("GVEX", "LIBD_szControl")) %>%
+  ggplot(aes(x = causeDeathSuic, y = ageDeath, fill = primaryDiagnosis, color = primaryDiagnosis)) +
+  # Violin plots (match border to fill color)
+  geom_violin(alpha = 0.4, position = position_dodge(width = 0.8)) +
+  # Beeswarm points (match color to group)
+  geom_quasirandom(shape = 16, alpha = 0.9, dodge.width = 0.8) + 
+  # Mean marker (black diamonds)
+  stat_summary(fun = mean, geom = "point", size = 4, shape = 23, color = "black", 
+               position = position_dodge(width = 0.8)) +
+  # Axis labels
+  ylab("Age at Death") + 
+  xlab("Cause of Death") +
+  scale_x_discrete(labels = c("other" = "Other", "suicide" = "Suicide")) +
+  # Consistent fill and border colors
+  scale_fill_manual(values = c("dodgerblue2", "firebrick2")) +
+  scale_color_manual(values = c("dodgerblue2", "firebrick2")) +
+  # Standardized theme elements
+  theme(
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(vjust = -2, size = 15),
+    axis.title.y = element_text(size = 15),
+    strip.text.x = element_text(size = 14),
+    strip.text.y = element_text(size = 14),
+    legend.position = "none",
+  ) +
+  # Facet by newStudy with free y-scales
+  facet_wrap(~ newStudy, scales = "free_y") +
+  # Significance test: "other" vs "suicide"
+  geom_signif(comparisons = list(c("other", "suicide")), 
+            map_signif_level = TRUE, 
+            test = wilcox.test, 
+            textsize = 3, 
+            color = "black")
+
+#Plot without Suicide 
+panel_B = mgp_suicide_long %>% filter(ageDeath < 90) %>% filter(causeDeathSuic == "other") %>%
+  filter(cell_type %in% c("SST", "PVALB", "VIP")) %>%
+  ggplot(aes(x = ageDeath, y = rel_prop, color = primaryDiagnosis)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = F, method = 'lm', fullrange = T) +
+  ylab('Relative Cell Prop.') + 
+  xlab('Age') + 
+  theme(
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(vjust = -2, size = 15),
+    axis.title.y = element_text(size = 15),
+    legend.position = c(0.9, 0.9),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),  
+    strip.text.x = element_text(size = 14)) +
+  facet_grid(newStudy~cell_type, drop = T, scale = "free_x", space = "free") +
+  guides(fill = guide_legend(nrow = 1)) +
+  scale_y_continuous(limits = c(-3, 3)) + 
+  scale_color_manual(values = c("dodgerblue2", "firebrick2"), labels=c('CON', 'SCZ'))
+
+
+```
+
+```{r}
+# Filter combined_lms for the desired cell types and term
+combined_filtered <- combined_lms %>%
+  filter(cell_type %in% c("PVALB", "SST", "VIP"), term == "SCZ")
+
+# Filter mega_lms for the same conditions and add newStudy column as "All"
+mega_filtered <- mega_lms %>%
+  filter(cell_type %in% c("PVALB", "SST", "VIP"), term == "SCZ") %>%
+  mutate(dataset = "Mega")
+
+# Combine the filtered data frames into mega_results
+mega_results <- bind_rows(combined_filtered, mega_filtered) %>%
+  rename(Cohort = dataset)
+
+mega_results <- mega_results %>%
+  mutate(CI_lower = estimate - 1.96 * std.error,
+         CI_upper = estimate + 1.96 * std.error)
+```
+
+
+```{r}
+# Compute sample sizes by cohort (newStudy) and age_class
+sample_sizes <- mgp_suicide %>%
+  group_by(newStudy) %>%
+  summarise(Sample_Size = n()) %>%
+  ungroup()
+# Compute sample sizes for the mega-analysis ("All") for each age_class
+sample_sizes_all <- mgp_suicide %>%
+  summarise(Sample_Size = n()) %>%
+  mutate(newStudy = "Mega") %>%
+  ungroup()
+
+# Combine the sample sizes
+sample_sizes_combined <- bind_rows(sample_sizes, sample_sizes_all)
+
+# Join the sample sizes to mega_results (matching on age_class and Cohort)
+mega_results <- mega_results %>%
+  left_join(sample_sizes_combined, by = c("Cohort" = "newStudy"))
+```
+
+
+```{r}
+# Step 1: Define custom shape mapping
+mega_results <- mega_results %>%
+  mutate(
+    Shape = ifelse(Cohort == "Mega", "Pooled", "Individual")
+  )
+
+# Step 2: Factor Cohort to control order
+mega_results$Cohort <- factor(mega_results$Cohort,
+                             levels = c("Mega","LIBD_szControl","GVEX"))
+
+
+mega_results_sig <- mega_results %>% 
+  mutate(
+    ci_excludes_zero = CI_lower > 0 | CI_upper < 0,
+    # aterisk string based on FDR-adjusted P
+    signif_lab = case_when(
+      ci_excludes_zero & padj <= 0.01 ~ "***",
+      ci_excludes_zero & padj <= 0.05 ~ "**",
+      ci_excludes_zero & padj <= 0.10 ~ "*",
+      TRUE                            ~ ""
+    ),
+    signif_x   = ifelse(estimate > 0, CI_upper, CI_lower),
+    hjust_val  = ifelse(estimate > 0, -0.25, 1.25)
+  )
+
+# Step 3: Plot
+fp <- ggplot(mega_results_sig, aes(x = estimate, y = Cohort)) +
+  geom_point(aes(size = Sample_Size, color = Cohort, shape = Shape)) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper, color = Cohort),
+                 height = 0.2) +
+  geom_text(
+    aes(x = signif_x, label = signif_lab, hjust = hjust_val),
+    vjust = 0.5,                                 
+    size  = 5, fontface = "bold", na.rm = TRUE
+  ) +
+  facet_grid(~ cell_type, switch = "y") +
+  scale_shape_manual(values = c("Pooled" = 18, "Individual" = 16)) +
+  scale_size_continuous(range = c(2, 6)) +
+  scale_color_manual(values = c(
+    "GVEX"          = "#009E73",
+    "LIBD_szControl"= "#0072B2"
+  )) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    x = "Effect Size (Estimate)",
+    y = "Cohort",
+    size = "Sample Size"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "right",
+    axis.text.x     = element_text(size = 15),
+    axis.text.y     = element_blank(),
+    axis.title.x    = element_text(vjust = -2, size = 15),
+    axis.title.y    = element_text(size = 15),
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 12),
+    strip.text.x    = element_text(size = 15),
+    strip.text.y    = element_text(size = 15),
+    plot.margin     = margin(t = 5, r = 15, b = 15, l = 5)   # avoids clipping
+  ) +
+  guides(shape = "none")
+
+```
+
+Final Figure
+```{r, fig.height=6, fig.width=5}
+figure <- (
+    panel_A /         
+    panel_B /         
+    fp                  
+) +
+  plot_layout(heights = c(1, 1, 1)) +        
+  plot_annotation(tag_levels = 'A') &        
+  theme(
+    plot.tag      = element_text(size = 25),
+  )
+
+figure
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,201 @@
+---
+title: "psychencode_mgp_analysis"
+author: "Daniel Kiss"
+date: "1/24/2024"
+output: html_document
+---
+
+Packages etc.
+```{r}
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library(markerGeneProfile) 
+library(matrixStats)
+library(cowplot)
+library(broom)
+library(knitr)
+library(ggpubr)
+library(biomaRt)
+library(ggrepel)
+library(patchwork)
+library(ggsignif)
+library(modelr)
+library(ggbeeswarm)
+library(lemon)
+theme_set(theme_classic2())
+#Colour palette
+cbPalette = c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+Load and format matrices
+```{r}
+GVEX_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/GVEX_count_matrix.csv")
+names(GVEX_matrix) = gsub("X", '', names(GVEX_matrix))
+names(GVEX_matrix)[1] = "gene_symbol"
+LIBD_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/LIBD_count_matrix.csv")
+names(LIBD_matrix) = gsub("X", '', names(LIBD_matrix))
+names(LIBD_matrix)[1] = "gene_symbol"
+CMC_matrix = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/CMC_count_matrix.csv")
+names(CMC_matrix) = gsub("X", '', names(CMC_matrix))
+names(CMC_matrix)[1] = "gene_symbol"
+
+#Rename EnsemblIDs to be compatible with gene names
+GVEX_matrix$gene_symbol = gsub("\\..*", '', GVEX_matrix$gene_symbol)
+LIBD_matrix$gene_symbol = gsub("\\..*", '', LIBD_matrix$gene_symbol)
+CMC_matrix$gene_symbol = gsub("\\..*", '', CMC_matrix$gene_symbol)
+
+#Make EnsemblIDs row names
+row.names(GVEX_matrix) = GVEX_matrix$gene_symbol
+GVEX_matrix = GVEX_matrix[,-1]
+row.names(LIBD_matrix) = LIBD_matrix$gene_symbol
+LIBD_matrix = LIBD_matrix[,-1]
+row.names(CMC_matrix) = CMC_matrix$gene_symbol
+CMC_matrix = CMC_matrix[,-1]
+
+#Combine into one large matrix for easier analysis
+combined_matrix = cbind(GVEX_matrix, LIBD_matrix, CMC_matrix)
+
+```
+
+Load and format metadata
+```{r}
+psychencode_metadata = read.csv(("/external/rprshnas01/external_data/psychencode/PsychENCODE/Metadata/CapstoneCollection_Metadata_Clinical.csv"))
+
+GVEX_metadata = read.delim("/external/rprshnas01/external_data/psychencode/PsychENCODE//BrainGVEX/RNAseq/SYNAPSE_METADATA_MANIFEST.tsv") %>% filter(dataType == "geneExpression")  %>% left_join(psychencode_metadata)
+LIBD_metadata = read.delim("/external/rprshnas01/external_data/psychencode/PsychENCODE/LIBD__szControl/RNAseq/SYNAPSE_METADATA_MANIFEST.tsv") %>% filter(dataType == "geneExpression")  %>% left_join(psychencode_metadata)
+CMC_metadata = read.csv("/external/rprshnas01/external_data/psychencode/PsychENCODE/CMC/Metadata/SYNAPSE_TABLE_QUERY_123020650.csv") %>% filter(dataType == "geneExpression", fileFormat == "tsv")  %>% left_join(psychencode_metadata)
+names(CMC_metadata)[names(CMC_metadata) == "Individual_ID"] = "individualID"
+
+#Change LIBD NAs to LIBD_szControl 
+LIBD_metadata[which(is.na(LIBD_metadata$individualIdSource)), 'individualIdSource'] = 'LIBD_szControl'
+
+columns = names(GVEX_metadata) %>% intersect(names(LIBD_metadata)) %>% intersect(names(CMC_metadata))
+#Combine all metadata, filter based on inclusion criteria, and add newStudy column for cohort-based MGP
+combined_metadata = rbind(GVEX_metadata[, columns], LIBD_metadata[, columns], CMC_metadata[, columns])
+#Remove '+' from ageDeath for estimation/filtering
+combined_metadata$ageDeath = as.numeric(gsub("[+]", "", combined_metadata$ageDeath))
+#Additional filtering 
+combined_metadata = combined_metadata %>% filter(!grepl("_BP_", specimenID), contributingStudy != "[\"BrainGVEX\"]", contributingStudy != "[\"LIBD_szControl\"]", !is.na(individualIdSource), primaryDiagnosis %in% c("control", "Schizophrenia"), ageDeath >= 15)
+#Create newStudy column for filtering
+combined_metadata = combined_metadata %>%
+  mutate(newStudy = case_when(
+    contributingStudy == "LIBD_szControl"           ~ "LIBD_szControl",
+    contributingStudy == "[\"CMC_HBCC\"]"           ~ "NIMH_HBCC",
+    grepl("SMRI", individualIdSource)               ~ "GVEX",
+    individualIdSource == "MSSM"                    ~ "MSSM",
+    individualIdSource == "Penn"                    ~ "Penn",
+    individualIdSource == "Pitt"                    ~ "Pitt",
+    TRUE                                            ~ "Not_Used"
+  )) %>% filter(newStudy != "Not_Used")
+```
+
+Subset matrices based on study cohort
+```{r}
+#GVEX and LIBD matrices are named based on sampleID, whereas CMC is named based on individualID
+#Create standardID to pull samples from the same column
+combined_metadata = combined_metadata %>%
+  mutate(standardID = ifelse(newStudy %in% c("MSSM", "Penn", "Pitt"), individualID, specimenID)) %>%
+  mutate(standardID = ifelse(newStudy == "GVEX", 
+                             str_replace_all(standardID, "-", "."), 
+                             standardID))
+combined_metadata = combined_metadata %>%
+  mutate(dataset = case_when(
+    newStudy %in% c("NIMH_HBCC", "MSSM", "Pitt", "Penn") ~ "CMC",
+    newStudy == "GVEX"                                   ~ "GVEX",
+    newStudy == "LIBD_szControl"                         ~ "LIBD_szControl",
+    TRUE                                                 ~ NA_character_
+  ))
+#Create cohort specific matrices
+libd_samples = combined_metadata %>% filter(newStudy == "LIBD_szControl") %>% pull(standardID)
+nimh_samples = combined_metadata %>% filter(newStudy == "NIMH_HBCC") %>% pull(standardID)
+gvex_samples = combined_metadata %>% filter(newStudy == "GVEX") %>% pull(standardID) 
+mssm_samples = combined_metadata %>% filter(newStudy == "MSSM") %>% pull(standardID)
+penn_samples = combined_metadata %>% filter(newStudy == "Penn") %>% pull(standardID)
+pitt_samples = combined_metadata %>% filter(newStudy == "Pitt") %>% pull(standardID)
+#Create matrices
+gene_symbol = rownames(combined_matrix)
+libd_matrix = combined_matrix[, colnames(combined_matrix) %in% libd_samples] 
+nimh_matrix = combined_matrix[, colnames(combined_matrix) %in% nimh_samples] 
+gvex_matrix = combined_matrix[, colnames(combined_matrix) %in% gvex_samples] 
+mssm_matrix = combined_matrix[, colnames(combined_matrix) %in% mssm_samples] 
+penn_matrix = combined_matrix[, colnames(combined_matrix) %in% penn_samples]
+pitt_matrix = combined_matrix[, colnames(combined_matrix) %in% pitt_samples] 
+```
+
+Cell-Type Proportion Estimation: Updated marker list from Micaela's paper
+```{r}
+### GET MARKERS FOR MGP ANALYSIS
+# note that this is the list of markers from micaela's paper - you get similar but diff results if you use the markers from the aging paper
+sonny_markers = read_csv(url('https://raw.githubusercontent.com/sonnyc247/MarkerSelection/master/Data/Outputs/CSVs_and_Tables/Markers/MTG_and_CgG_lfct2/new_MTGnCgG_lfct2.5_Publication.csv'))
+colnames(sonny_markers) = colnames(sonny_markers) %>% make.names() %>% tolower()
+
+hgnc_mapping = read_tsv('/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/hgnc_complete_set.txt')
+
+# now, this is the list of sonnys markers with entrez ids and ensembl ids where possible
+sonny_hgnc_merged_markers = left_join(sonny_markers %>% dplyr::rename(entrez_id = entrez.gene.id), 
+                                      hgnc_mapping %>% distinct(entrez_id, .keep_all = T)%>% 
+                                        dplyr::select(entrez_id, ensembl_gene_id) %>% 
+                                        dplyr::rename(ensembl_id = ensembl_gene_id)) %>% 
+  dplyr::select(gene, entrez_id, ensembl_id, -ensembl.gene.id, everything()) %>% 
+  group_by(subclass) %>% 
+  arrange(subclass, -average.log.fold.change) %>% 
+  ungroup()
+
+# get ensembl list of markers
+new_markers = sonny_hgnc_merged_markers %>% filter(used.in.mgp == "TRUE")
+new_cell_types = new_markers %>% filter(!is.na(subclass)) %>% pull(subclass) %>% unique
+new_marker_list  = lapply(new_cell_types, function(cell_type){
+  cell_type_marker_list = new_markers %>% 
+    filter(subclass == cell_type, ensembl_id %in% rownames(combined_matrix)) %>% 
+    pull(ensembl_id)
+  return(cell_type_marker_list)
+})
+names(new_marker_list) = new_cell_types
+print(new_cell_types)
+write.csv(new_markers, "~/cell_prop_psychiatry/data/MGP_markers.csv")
+```
+
+Normalize and process count matrices and perform MGP analysis
+```{r}
+cell_types = new_marker_list$subclass %>% unique()
+
+#Define vector of file names to perform MGP on and initialize empty variable before looping
+matrix_names = c("libd_matrix",  "nimh_matrix", "gvex_matrix", "mssm_matrix", "penn_matrix", "pitt_matrix")
+mgp_estimations = setNames(data.frame(matrix(ncol = length(c(colnames(combined_metadata), cell_types)), nrow = 0)), c(colnames(combined_metadata), cell_types))
+
+for(matrix_name in matrix_names) {
+  #Preprocessing
+  matrix = get(matrix_name)
+  cpm = cpm(matrix, log = TRUE, prior.count = 0.1)
+  sds = rowSds(cpm, na.rm = TRUE)
+  matrix = cpm[sds > 0.1,] %>% as.data.frame() %>% rownames_to_column(var = "gene_symbol") #Consider setting SD cutoff to 0 
+  genes_only = matrix %>% subset(gene_symbol != "")
+if(length(which(duplicated(genes_only$gene_symbol))) != 0){
+  genes_only = genes_only[-which(duplicated(genes_only$gene_symbol)),]
+}
+
+estimations = mgpEstimate(
+  exprData = genes_only,
+  genes = new_marker_list,
+  geneColName = 'gene_symbol',
+  outlierSampleRemove = F, # should outlier samples removed. This is done using boxplot stats
+  geneTransform = NULL, # this is the default option for geneTransform
+  groups = NULL, # if there are experimental groups provide them here. if not desired set to NULL
+  seekConsensus = FALSE, # ensures gene rotations are positive in both of the groups
+  removeMinority = F)
+
+#Coerce estimations list into data frame 
+estimations_scaled <- estimations$estimates %>% as.data.frame() %>% scale() %>% as.data.frame() %>% tibble::rownames_to_column(var = "standardID")
+estimations_metadata <- right_join(combined_metadata, estimations_scaled, by = "standardID")
+
+#Merge cell type proportions with sample metadata
+estimations_metadata = right_join(combined_metadata, estimations_scaled )
+
+mgp_estimations = rbind(mgp_estimations, estimations_metadata) 
+}
+
+write.csv(mgp_estimations, "/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/psychencode_mgp_estimations.csv")
+```
+
+

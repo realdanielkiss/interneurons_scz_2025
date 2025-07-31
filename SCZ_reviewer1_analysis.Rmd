@@ -1,0 +1,196 @@
+
+
+Loading Data
+```{r}
+# Cell type proportions for each dataset merged with metadata - ready for modelling
+mgp_estimations = read_csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/psychencode_mgp_estimations.csv")
+# Filter out samples below a certain age
+mgp_estimations = mgp_estimations %>% filter(ageDeath >= 15)
+# Factorize 'newStudy' for aesthetic purposes (this order looks good on graphs)
+mgp_estimations$newStudy = mgp_estimations$newStudy %>% factor(
+  levels = c("Pitt", "GVEX", "NIMH_HBCC", "LIBD_szControl", "MSSM", "Penn")
+)
+# Convert data from wide to long format
+mgp_estimations_long = mgp_estimations %>%
+  pivot_longer(
+    cols = Astrocyte:VLMC, 
+    names_to = 'cell_type', 
+    values_to = 'rel_prop'
+  ) %>%
+  mutate(cell_class = case_when(
+    cell_type %in% c("PVALB", "SST", "VIP", "LAMP5", "PAX6") ~ "Inhibitory",
+    cell_type %in% c("IT", "L4.IT", "L5.ET", "L5.6.IT.Car3", "L5.6.NP", "L6.CT", "L6b") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal"
+  ))
+# Order factor levels for cell_type and cell_class
+mgp_estimations_long$cell_type = factor(
+  mgp_estimations_long$cell_type,
+  levels = c("PVALB","SST","VIP","LAMP5","PAX6","IT","L4.IT","L5.ET",
+             "L5.6.IT.Car3","L5.6.NP","L6.CT","L6b","Astrocyte",
+             "Endothelial","Microglia","Oligodendrocyte","OPC","Pericyte","VLMC")
+)
+mgp_estimations_long$cell_class = factor(
+  mgp_estimations_long$cell_class,
+  levels = c("Inhibitory", "Excitatory", "Non-Neuronal")
+)
+```
+
+```{r, fig.height=6, fig.width=6}
+mgp_estimations_long = mgp_estimations_long %>%
+  group_by(cell_type) %>%
+  mutate(resid = resid(lm(scale(rel_prop) ~ scale(RIN) + scale(PMI) + reportedGender))) %>%
+  ungroup()
+
+fig_resid = mgp_estimations_long %>% 
+  filter(ageDeath < 90) %>%
+  filter(cell_type %in% c("SST", "PVALB", "VIP")) %>%
+  ggplot(aes(x = ageDeath, y = resid, color = primaryDiagnosis)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = FALSE, method = "lm", fullrange = TRUE) +
+  ylab("SCZ rCTP Resid.") + 
+  xlab("Age at death") + 
+  theme(
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(vjust = -2, size = 15),
+    axis.title.y = element_text(size = 15),
+    legend.position = c(0.9, 0.9),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),  
+    strip.text.x = element_text(size = 14)
+  ) +
+  facet_grid(newStudy ~ cell_type, drop = TRUE, scale = "free_x", space = "free") +
+  guides(fill = guide_legend(nrow = 1)) +
+  scale_color_manual(values = c("dodgerblue2", "firebrick2"), labels = c("CON", "SCZ"))
+
+fig_resid
+
+fig_raw = mgp_estimations_long %>% 
+  filter(ageDeath < 90) %>%
+  filter(cell_type %in% c("SST", "PVALB", "VIP")) %>%
+  ggplot(aes(x = ageDeath, y = rel_prop, color = primaryDiagnosis)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = FALSE, method = "lm", fullrange = TRUE) +
+  ylab("SCZ rCTP Raw.") + 
+  xlab("Age at death") + 
+  theme(
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(vjust = -2, size = 15),
+    axis.title.y = element_text(size = 15),
+    legend.position = c(0.9, 0.9),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),  
+    strip.text.x = element_text(size = 14)
+  ) +
+  facet_grid(newStudy ~ cell_type, drop = TRUE, scale = "free_x", space = "free") +
+  guides(fill = guide_legend(nrow = 1)) +
+  scale_color_manual(values = c("dodgerblue2", "firebrick2"), labels = c("CON", "SCZ"))
+
+fig_raw
+
+
+```
+
+Add age class (Above_70 and Below_70)
+```{r}
+# Define a function to classify ages into "Under 70" vs. "Over 70"
+classify_ages = function(ages) {
+  classifications = ifelse(ages <= 70, "Under 70", "Over 70")
+  return(classifications)
+}
+#Apply the function to the 'ageDeath' column 
+mgp_estimations_long$age_class <- sapply(mgp_estimations_long$ageDeath, classify_ages) %>% factor(levels = c("Under 70", "Over 70"))
+#Fit linear models by age_class, cell_type, and newStudy
+lms_by_age_class = mgp_estimations_long %>% 
+  group_by(age_class, cell_type, newStudy) %>%
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) + scale(PMI) + reportedGender + primaryDiagnosis, data = .))) %>%
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'fdr'),
+         term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+                       `scale(ageDeath)` = "Age",
+                       `scale(PMI)` = "PMI")) %>%
+  merge(unique(mgp_estimations_long[c('cell_class', 'cell_type')]), by.x = "cell_type") 
+
+#Taly subjects:
+age_class_subject_counts = mgp_estimations_long %>%
+    group_by(newStudy, age_class) %>%
+    summarize(n_subjects = n_distinct(individualID)) %>%
+    ungroup()
+
+
+```
+
+
+```{r, fig.height=9, fig.width=9}
+# Subset significant results (padj <= 0.1) for SCZ vs. control comparisons
+significant_age_class = subset(
+  lms_by_age_class,
+  padj <= 0.1 & term == "SCZ" & cell_type %in% c("SST", "PVALB", "VIP")
+)
+# Assign asterisks based on adjusted p-value thresholds
+significant_age_class$asterisks = ifelse(
+  significant_age_class$padj <= 0.01, 
+  "***", 
+  ifelse(significant_age_class$padj <= 0.05, "**", "*")
+)
+# Position the asterisk above or below the bar depending on the sign of the estimate
+significant_age_class$vjust = ifelse(
+  significant_age_class$estimate >= 0, 
+  -3, 
+  3
+)
+
+figure = lms_by_age_class %>% 
+  filter(term == "SCZ" & cell_type %in% c("SST", "PVALB", "VIP")) %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_class, y = estimate, fill = age_class)) +
+  # Horizontal reference line at 0
+  geom_hline(yintercept = 0, color = "grey40") +
+  # Bar plot of the beta coefficient
+  geom_bar(stat = "identity", position = "dodge") +
+  # Error bars: ±1 standard error
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error),
+                width = 0.2, position = position_dodge(width = 0.9)) +
+  # Axis labels
+  ylab("Beta Coefficient") +
+  xlab("\n \n Age Range") +
+  # Custom fill colors for the two age bins
+  scale_fill_manual(
+    values = c("mediumpurple3", "olivedrab3"),
+    labels = c("Above 70", "Below 70")
+  ) +
+  # Add the significance asterisks from the subset
+  geom_text(data = significant_age_class,
+            aes(x = age_class, y = estimate, label = asterisks, vjust = vjust),
+            position = position_dodge(width = 0.9)) +
+  # Facet by newStudy (rows) and cell_type (columns)
+  facet_grid(newStudy ~ cell_type, drop = TRUE, scale = "free_x", space = "free") +
+  # A bit of theming
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 13),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(vjust = 8, size = 15),
+    axis.title.y = element_text(size = 15),
+    strip.text.x = element_text(size = 14),
+    strip.text.y = element_text(size = 14)
+  ) +
+  # Hide the fill legend (optional)
+  guides(fill = FALSE)
+
+figure
+
+```
+
+
+
+
+
+
+
+
+
+

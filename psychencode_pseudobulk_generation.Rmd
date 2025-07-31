@@ -1,0 +1,61 @@
+---
+title: "Untitled"
+author: "Daniel Kiss"
+date: "1/24/2024"
+output: html_document
+---
+```{r}
+#Load seurat object
+query = readRDS('/external/rprshnas01/netdata_kcni/stlab/Xiaolin/cell_deconv_data/PsychEncode_label_transfer_result_empty_removed.RData')
+# get counts matrix
+query_matrix = readRDS('/external/rprshnas01/netdata_kcni/stlab/Xiaolin/cell_deconv_data/counts_sn.RData')
+
+```
+
+```{r}
+#Cell-level metadata
+query_metadata = query@meta.data
+query_metadata = query_metadata[,-1]%>%
+  mutate(subclass_label = predicted.id) %>%
+  # remove missing subclass labels 
+  filter(!(subclass_label == "" | is.na(subclass_label))) %>%
+  # column for each unique subject and cell type (don't save as factor)
+  mutate(pseudobulk_group = as.character(interaction(Phenotype, subclass_label))) %>%
+  # number of cells per subtype
+  group_by(Phenotype, subclass_label) %>%
+  mutate(n_cells = n()) %>%
+  as.data.frame()
+rownames(query_metadata) = query_metadata$cell_id
+
+query_metadata = query_metadata %>%
+  mutate(unique_donor_ID = paste(ID, Internal_ID, sep = "_")) %>%
+  select(unique_donor_ID, everything())
+```
+
+```{r}
+pseudobulk_metadata_new = query_metadata %>%
+  group_by(unique_donor_ID, ID, predicted.id, Cohort, Internal_ID, CMC_ID, Phenotype, Batch, HTO, 
+Gender, Age, PMI, EUR_Ancestry, EAS_Ancestry, AMR_Ancestry, SAS_Ancestry, AFR_Ancestry, 
+Benzodiazepines, Anticonvulsants, AntipsychTyp, AntipsychAtyp, Antidepress, Lithium, PRS) %>%
+  summarise(num_cells = n(), .groups = 'drop') %>% rename(Celltype = predicted.id)
+
+pseudobulk_metadata_new$Celltype =  pseudobulk_metadata_new$Celltype %>% make.names()
+
+
+write.csv(pseudobulk_metadata_new, "~/cell_prop_psychiatry/data/psychencode_label_transferred_pseudobulk_metadata.csv")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

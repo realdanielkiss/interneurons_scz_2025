@@ -1,0 +1,152 @@
+---
+title: "psychencode_DE_no_age_bins"
+author: "Daniel Kiss"
+date: "8/30/2023"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(Seurat)
+  library(edgeR)
+  library(ggrepel)
+  library(cowplot)
+  library(limma)
+  library(ggpubr)
+  library(gprofiler2)
+  library(EnhancedVolcano)
+  library(patchwork)
+})
+theme_set(theme_classic2())
+#Colour palette
+cbPalette <- c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+Simple volcano plot function 
+```{r}
+simple_volcano <- function(x) {
+  x %>%
+    ggplot(aes(x = logFC, y = -log10(P.Value), label = genes)) + 
+    geom_point() +
+    geom_text_repel(data = subset(x, adj.P.Val < 0.1), 
+                    aes(label = genes), 
+                    vjust = 1.5) + 
+    geom_point(data = subset(x, adj.P.Val < 0.1), 
+               aes(color = 'red')) + 
+    theme_cowplot() +
+    theme(legend.position = "none")
+}
+```
+
+
+Load Data // Define Variables
+```{r}
+pseudobulk = read.delim("/external/rprshnas01/netdata_kcni/stlab/SZBDMulticohort/pseudobulk_fine_grained.counts.tsv")
+pseudobulk_metadata = read.delim("/external/rprshnas01/netdata_kcni/stlab/SZBDMulticohort/pseudobulk_fine_grained.metadata.tsv")
+#Add age group column to metadata
+pseudobulk_metadata <- pseudobulk_metadata %>%
+  mutate(age_range = ifelse(Age < 70, "under_70", "over_70"))
+
+CELL_TYPES = pseudobulk_metadata$Celltype %>% unique()
+USE_COHORT = 'McLean'
+NUM_CELLS = 50
+
+DE_data = list()
+```
+
+
+
+Create a list of relevant data for each cell type
+```{r}
+for(CELL_TYPE in CELL_TYPES) {
+  USE_SUBJECTS = pseudobulk_metadata %>% filter(Celltype == CELL_TYPE, Cohort == USE_COHORT, num_cells > NUM_CELLS) %>% pull(unique_donor_ID)
+  #Filtering subjects
+  SCZ_IDs = pseudobulk_metadata %>% filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE, Phenotype == "SZ") %>% pull(unique_donor_ID)
+  CON_IDs = pseudobulk_metadata %>% filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE, Phenotype == "CON") %>% pull(unique_donor_ID)
+  if(length(SCZ_IDs) < 5 || length(CON_IDs) < 5) {
+    next  # Skip to the next iteration of the loop if either SZ or CON have less than 5 individuals in this cell types
+  }
+  #Define modelling variables
+  disease = factor( pseudobulk_metadata %>% filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE) %>% 
+    pull(Phenotype), levels = c('CON', 'SZ'))
+  sex =  factor( pseudobulk_metadata %>% filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE) %>% 
+    pull(Gender), levels = c('Male', 'Female'))
+  pmi =  pseudobulk_metadata %>% 
+  filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE) %>% 
+  pull(PMI)
+  #age =  pseudobulk_metadata %>% 
+  #filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE) %>% 
+  #pull(Age)
+  log_10_cells_per_donor =  pseudobulk_metadata %>% 
+  filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE) %>% 
+  pull(num_cells) %>% log10()
+  age_group =  factor(pseudobulk_metadata %>% 
+  filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE) %>% 
+  pull(age_range), levels = c("under_70", "over_70"))
+  #Create model matrix
+  design = model.matrix(~disease + pmi + sex + log_10_cells_per_donor + age_group)
+  #Create count matrices
+  counts = pseudobulk %>% filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE)
+  counts = counts[, 3:ncol(counts)] %>% t() %>% as.data.frame()
+  colnames(counts) = USE_SUBJECTS
+  #Create DGE objects
+  dge = DGEList(counts, genes = row.names(counts))
+  min_samples = pseudobulk_metadata %>% filter(unique_donor_ID %in% USE_SUBJECTS, Celltype == CELL_TYPE) %>% nrow * 0.8
+  dge = dge[rowSums(dge$counts >= 1) >= min_samples, ]
+  dge = calcNormFactors(dge, method = "TMM")
+  #Create list to save data
+  data_list = list(design, dge)
+  names(data_list) = c("design", "dge")
+  #Append to DE data
+  DE_data[[CELL_TYPE]] = data_list
+}
+  
+```
+
+Now that we have all data pre-processed and organized for DE analysis, let's loop through DE_data and output results to DE_results (This will take a few minutes to run)
+```{r}
+DE_results = list()
+for(CELL_TYPE in names(DE_data)) {
+  #Load data from DE_data
+  dge = DE_data[[CELL_TYPE]]$dge
+  design = DE_data[[CELL_TYPE]]$design
+  #Voom transform
+  vm = voom(dge, design, plot = F)
+  fit = lmFit(vm, design) %>% eBayes()
+  DE = topTable(fit, coef ="age_groupover_70", number = 20000 )
+  #Plots
+  volcano = DE %>% simple_volcano()
+  #Append to list
+  joined_results = list(DE, volcano)
+  names(joined_results) = c("results", "volcano_plot")
+  DE_results[[CELL_TYPE]] = joined_results
+}
+
+
+```
+
+Loop through results and count # of DE genes at a certain padj threshold
+```{r}
+num_genes = c()
+for(CELL_TYPE in names(DE_results)) {
+  data = DE_results[[CELL_TYPE]]$results %>% subset(adj.P.Val < 0.05)
+  ngenes = nrow(data)
+  num_genes = c(num_genes, ngenes)
+}
+
+psychencode_MGP_models = read.csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/psychencode_MGP_models_mega")
+MGP_models_subset = psychencode_MGP_models[psychencode_MGP_models$term == "Intercept", ]
+beta_vals = MGP_models_subset[, c("cell_type", "estimate")]
+
+tibble(CELL_TYPE = names(DE_results), num_genes = num_genes) %>% view
+```
+
+
+
+
+
+
+
+
+

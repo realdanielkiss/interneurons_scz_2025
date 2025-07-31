@@ -1,0 +1,528 @@
+---
+title: "psychencode_metadata_tables"
+author: "Daniel Kiss"
+date: "3/12/2025"
+output: html_document
+---
+Packages etc.
+```{r}
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library(markerGeneProfile) 
+library(matrixStats)
+library(cowplot) 
+library(broom)
+library(knitr)
+library(ggpubr)
+library(ggrepel)
+library(patchwork)
+library(ggsignif)
+library(modelr)
+library(ggbeeswarm)
+library(lemon)
+theme_set(theme_classic2())
+#Colour palette
+cbPalette = c("#56B4E9", "#009E73","#E69F00", "#0072B2", "#D55E00", "#CC79A7","#000000","#F0E442")
+```
+
+Load Bulk Data
+```{r}
+#Cell type proportions for each data set merged with metadata - ready for modelling 
+mgp_estimations = read_csv( "/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/psychencode_mgp_estimations.csv") 
+acc_estimations = read_csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/cmc_acc_mgp_estimations.csv") %>% filter(primaryDiagnosis %in% c("control", "Schizophrenia"))
+#Factorize newStudy for aesthetic purposes (this orderl ooks good on graphs)
+mgp_estimations = mgp_estimations %>% filter(ageDeath >= 15)
+mgp_estimations$newStudy = mgp_estimations$newStudy %>% factor(levels = c("Pitt", "GVEX", "NIMH_HBCC", "LIBD_szControl", "MSSM", "Penn"))
+
+#Add PMI info from CMC metadata
+psychencode_metadata = read.csv(("/external/rprshnas01/external_data/psychencode/PsychENCODE/Metadata/CapstoneCollection_Metadata_Clinical.csv"))
+CMC_metadata = read.csv("/external/rprshnas01/external_data/psychencode/PsychENCODE/CMC/Metadata/SYNAPSE_TABLE_QUERY_123020650.csv") %>% filter(dataType == "geneExpression", fileFormat == "tsv")  %>% left_join(psychencode_metadata)
+names(CMC_metadata)[names(CMC_metadata) == "Individual_ID"] = "individualID"
+
+#Cell type proportions for each data set merged with metadata - ready for modelling 
+acc_estimations = read_csv("/external/rprshnas01/kcni/dkiss/cell_prop_psychiatry/data/cmc_acc_mgp_estimations.csv") %>% filter(primaryDiagnosis %in% c("control", "Schizophrenia")) %>% left_join(CMC_metadata[, c("individualID", "PMI")], by = "individualID")
+acc_estimations$newStudy = acc_estimations$newStudy %>% factor(levels = c("Pitt_ACC", "MSSM_ACC", "Penn_ACC"))
+
+```
+
+Load single cell data
+```{r}
+psychencode_snCTPs = read.csv('/external/rprshnas01/netdata_kcni/stlab/Xiaolin/cell_deconv_data/PsychEncode_label_transferred_snCTP.csv')
+snCTP_metadata = read.csv("~/cell_prop_psychiatry/data/psychencode_label_transferred_pseudobulk_metadata.csv")[,-1] %>%
+  group_by(ID) %>%
+  mutate(total_cells = sum(num_cells)) %>%
+  ungroup() 
+#Add log10 number of cells variable
+snCTP_metadata$log10_num_cells = log10(snCTP_metadata$num_cells)
+#Add age group variable
+snCTP_metadata =  snCTP_metadata %>%
+  mutate(age_group = case_when(
+    Age < 70 ~ "Under_70", Age >= 70 ~ "Over_70")) 
+snCTP_metadata$age_group = snCTP_metadata$age_group %>% factor(levels = c("Under_70", "Over_70"))
+psychencode_snCTPs = left_join(snCTP_metadata, psychencode_snCTPs) 
+
+psychencode_snCTPs = psychencode_snCTPs %>%  
+  distinct(unique_donor_ID, .keep_all = T)
+
+psychencode_snCTPs$individualID = ifelse(
+  !is.na(psychencode_snCTPs$CMC_ID), 
+  paste("CMC_", psychencode_snCTPs$CMC_ID, sep = ""),
+  paste("McLean_", psychencode_snCTPs$ID, sep = "")
+)
+```
+
+Load LCMseq data
+```{r}
+#Load Sibille Lab microscopy
+sibille_lab_cell_props = sibille_lab_cell_fractions = read_csv('/external/rprshnas01/netdata_kcni/stlab/cross_cohort_MGPs/sibille_lab_cell_fractions.csv') %>% filter(Subject.Group %in% c("Control", "SCHIZ")) %>% distinct()
+
+# this is the tetrad metadata
+tetrad_path = '/external/rprshnas01/netdata_kcni/stlab/Collaborators/Sibille/RNAseq_processed/'
+tetrad_meta = read_csv(paste0(tetrad_path, "pTable with correct med info.csv"))
+tetrad_meta$sample_names = str_sub(tetrad_meta$X, end=-5) %>% make.names()
+tetrad_meta$sample_names =  gsub("_", ".", tetrad_meta$sample_names)
+tetrad_meta = tetrad_meta %>% mutate(Subject = HU., 
+                       Reported.Gender = case_when(Sex == "M" ~"Male",
+                                                   Sex == "F" ~ "Female"),
+                       Age_norm = Age, 
+                       PMI..in.hours. = PMI) %>% filter(Cell.Type == "SST")
+
+microCTPs = left_join(sibille_lab_cell_props, tetrad_meta) %>% filter(Subject != 1367)
+microCTPs$individualID = microCTPs$Individual.ID
+
+microCTPs <- microCTPs %>%
+  mutate(individualID = ifelse(is.na(individualID), Subject, individualID))
+
+```
+
+
+Cohort demographic summary
+```{r}
+summary_df <- mgp_estimations %>%
+  mutate(individualIDSource = factor(newStudy, 
+         levels = c("Pitt", "GVEX", "NIMH_HBCC", "LIBD_szControl", "MSSM", "Penn"))) %>%
+  group_by(newStudy) %>%
+  summarise(
+    CohortName = first(newStudy),
+    PercentMale = mean(reportedGender == "male", na.rm = TRUE) * 100,
+    AvgAge = mean(ageDeath, na.rm = TRUE),
+    AgeSD = sd(ageDeath, na.rm = TRUE),
+    AgeMin = min(ageDeath, na.rm = TRUE),
+    AgeMax = max(ageDeath, na.rm = TRUE),
+    NumCases = sum(primaryDiagnosis == "Schizophrenia", na.rm = TRUE),
+    NumControls = sum(primaryDiagnosis == "control", na.rm = TRUE),
+    AvgPMI = mean(PMI, na.rm = TRUE),
+    PMISD = sd(PMI, na.rm = TRUE),
+    AvgPh = mean(pH, na.rm = TRUE),
+    PhSD = sd(pH, na.rm = TRUE)
+  ) %>%
+  mutate(
+    MeanAge = paste0(sprintf("%.2f", AvgAge), " (", sprintf("%.2f", AgeSD), ")"),
+    ageRange = paste0(AgeMin, "-", AgeMax),
+    MeanPMI = paste0(sprintf("%.2f", AvgPMI), " (", sprintf("%.2f", PMISD), ")"),
+    MeanpH = paste0(sprintf("%.2f", AvgPh), " (", sprintf("%.2f", PhSD), ")")
+  ) %>%
+  select(-AvgAge, -AgeSD, -AgeMin, -AgeMax, -AvgPMI, -PMISD, -AvgPh, -PhSD)
+
+```
+
+Plotting causeDeath vs. ageDeath - reviewer 3
+-Color code or different shapes for diagnosis on thi plot
+```{r, fig.height= 1.8, fig.width= 4}
+mgp_estimations <- mgp_estimations %>%
+  mutate(causeDeathSuic = ifelse(grepl("suic", causeDeath, ignore.case = TRUE), "suicide", "other")) %>%
+  dplyr::mutate(causeDeathSuic = factor(causeDeathSuic, levels = c("suicide", "other")))
+
+mgp_estimations %>% 
+  filter(!is.na(causeDeathSuic), newStudy %in% c("GVEX", "LIBD_szControl")) %>%
+  ggplot(aes(x = causeDeathSuic, y = ageDeath, fill = primaryDiagnosis, color = primaryDiagnosis)) +
+  # Violin plots (match border to fill color)
+  geom_violin(alpha = 0.4, position = position_dodge(width = 0.8)) +
+  # Beeswarm points (match color to group)
+  geom_quasirandom(shape = 16, alpha = 0.9, dodge.width = 0.8) + 
+  # Mean marker (black diamonds)
+  stat_summary(fun = mean, geom = "point", size = 4, shape = 23, color = "black", 
+               position = position_dodge(width = 0.8)) +
+  # Axis labels
+  ylab("Age at Death") + 
+  xlab("Cause of Death") +
+  scale_x_discrete(labels = c("other" = "Other", "suicide" = "Suicide")) +
+  # Consistent fill and border colors
+  scale_fill_manual(values = c("dodgerblue2", "firebrick2")) +
+  scale_color_manual(values = c("dodgerblue2", "firebrick2")) +
+  # Standardized theme elements
+  theme(
+    axis.text.x = element_text(size = 15),
+    axis.text.y = element_text(size = 15),
+    axis.title.x = element_text(vjust = -2, size = 15),
+    axis.title.y = element_text(size = 15),
+    strip.text.x = element_text(size = 14),
+    strip.text.y = element_text(size = 14)
+  ) +
+  # Facet by newStudy with free y-scales
+  facet_wrap(~ newStudy, scales = "free_y") +
+  # Significance test: "other" vs "suicide"
+  geom_signif(comparisons = list(c("other", "suicide")), 
+            map_signif_level = TRUE, 
+            test = wilcox.test, 
+            textsize = 3, 
+            color = "black")
+```
+
+# Plot 2: Metadata histograms for each study 
+Begin by creating a combined df with all data
+```{r}
+# For mgp_estimations (bulk DLPFC) - note that RIN is available
+mgp_estimations_filtered <- mgp_estimations %>%
+  select(individualID, ageDeath, PMI, reportedGender, primaryDiagnosis, RIN) %>%
+  mutate(cohort = mgp_estimations$newStudy,
+         dataType = "bulk",
+         brainArea = "DLPFC")
+
+# For ACC_estimations (bulk ACC) - RIN is available
+acc_estimations_filtered <- acc_estimations %>%
+  select(individualID, ageDeath, PMI, reportedGender, primaryDiagnosis, RIN) %>%
+  mutate(cohort = str_remove(acc_estimations$newStudy, "_ACC$"),
+         dataType = "bulk",
+         brainArea = "ACC")
+
+# For psychencode_snRNAseq - RIN is not present, so it will be NA
+psychencode_snCTPs_filtered <- psychencode_snCTPs %>%
+  rename(ageDeath = Age,
+         reportedGender = Gender,
+         primaryDiagnosis = Phenotype) %>%
+  select(individualID, ageDeath, PMI, reportedGender, primaryDiagnosis) %>%
+  mutate(cohort = recode(psychencode_snCTPs$Institution,
+                         "McLean" = "Mclean",
+                         "MtSinai" = "MSSM"),
+         dataType = "snRNAseq",
+         brainArea = "DLPFC",
+         RIN = NA)  # add placeholder for RIN
+
+# For microCTPs - RIN is not present, so it will be NA
+microCTPs_filtered <- microCTPs %>%
+  rename(ageDeath = Age,
+         reportedGender = Sex,
+         primaryDiagnosis = Subject.Group) %>%
+  select(individualID, ageDeath, PMI, reportedGender, primaryDiagnosis) %>%
+  mutate(cohort = "Pitt",
+         dataType = "FISH+LCMseq",
+         brainArea = "sgACC",
+         RIN = NA)  # add placeholder for RIN
+
+# Combine all datasets into one dataframe
+all_subjects <- bind_rows(mgp_estimations_filtered,
+                          acc_estimations_filtered,
+                          psychencode_snCTPs_filtered,
+                          microCTPs_filtered) %>%
+  # Standardize reportedGender and primaryDiagnosis labels
+  mutate(
+    reportedGender = case_when(
+      reportedGender %in% c("male", "Male", "M", "m") ~ "M",
+      reportedGender %in% c("female", "Female", "F", "f") ~ "F"
+    ),
+    primaryDiagnosis = case_when(
+      primaryDiagnosis %in% c("Schizophrenia", "SZ", "SCHIZ") ~ "SCZ",
+      primaryDiagnosis %in% c("control", "CON", "Control") ~ "CON"
+    )
+  )
+
+```
+
+```{r, fig.width=6.5, fig.height=6.5}
+bulk_DLPFC <- bulk_data %>% filter(brainArea == "DLPFC")
+bulk_ACC   <- bulk_data %>% filter(brainArea == "ACC")
+
+#Pre-compute summaries for Bulk DLPFC ####
+bulk_DLPFC_median_age <- bulk_DLPFC %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_age = median(ageDeath, na.rm = TRUE), .groups = "drop")
+bulk_DLPFC_median_pmi <- bulk_DLPFC %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_pmi = median(PMI, na.rm = TRUE), .groups = "drop")
+bulk_DLPFC_gender_counts <- bulk_DLPFC %>%
+  group_by(cohort, reportedGender, primaryDiagnosis) %>%
+  summarise(count = n(), .groups = "drop")
+bulk_DLPFC_max_count <- max(bulk_DLPFC_gender_counts$count, na.rm = TRUE)
+
+#Pre-compute summaries for Bulk ACC ####
+bulk_ACC_median_age <- bulk_ACC %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_age = median(ageDeath, na.rm = TRUE), .groups = "drop")
+bulk_ACC_median_pmi <- bulk_ACC %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_pmi = median(PMI, na.rm = TRUE), .groups = "drop")
+bulk_ACC_gender_counts <- bulk_ACC %>%
+  group_by(cohort, reportedGender, primaryDiagnosis) %>%
+  summarise(count = n(), .groups = "drop")
+bulk_ACC_max_count <- max(bulk_ACC_gender_counts$count, na.rm = TRUE)
+
+# Define diagnostic colors
+diag_colors <- c("CON" = "dodgerblue2", "SCZ" = "firebrick2")
+
+#Bulk DLPFC Plots
+
+# Density plot for ageDeath (DLPFC)
+p_age_bulk_DLPFC <- ggplot(bulk_DLPFC, aes(x = ageDeath, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 6, scales = "free_y") +
+  labs(x = "Age at Death", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = bulk_DLPFC_median_age, aes(xintercept = median_age, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = bulk_DLPFC_median_age,
+            aes(x = median_age, y = Inf, label = round(median_age, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+# Density plot for PMI (DLPFC)
+p_pmi_bulk_DLPFC <- ggplot(bulk_DLPFC, aes(x = PMI, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 6, scales = "free_y") +
+  labs(x = "PMI", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = bulk_DLPFC_median_pmi, aes(xintercept = median_pmi, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = bulk_DLPFC_median_pmi,
+            aes(x = median_pmi, y = Inf, label = round(median_pmi, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+# Horizontal bar plot for reportedGender (DLPFC)
+p_gender_bulk_DLPFC <- ggplot(bulk_DLPFC, aes(x = reportedGender, fill = primaryDiagnosis)) +
+  geom_bar(position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values = diag_colors) +
+  coord_flip() +
+  facet_wrap(~ cohort, ncol = 6) +
+  labs(x = "Gender", y = "Count") +
+  theme(legend.position = "none") +
+  geom_text(data = bulk_DLPFC_gender_counts,
+            aes(x = reportedGender, y = count, label = count, group = primaryDiagnosis),
+            position = position_dodge(width = 0.9),
+            hjust = -0.1, size = 3) +
+  scale_y_continuous(limits = c(0, bulk_DLPFC_max_count * 1.2))
+
+# Combine DLPFC subplots into one composite panel
+bulk_DLPFC_plot <- (p_age_bulk_DLPFC / p_pmi_bulk_DLPFC / p_gender_bulk_DLPFC) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Bulk DLPFC")
+
+
+# Bulk ACC Plots
+
+# Density plot for ageDeath (ACC)
+p_age_bulk_ACC <- ggplot(bulk_ACC, aes(x = ageDeath, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 3, scales = "free_y") +
+  labs(x = "Age at Death", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = bulk_ACC_median_age, aes(xintercept = median_age, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = bulk_ACC_median_age,
+            aes(x = median_age, y = Inf, label = round(median_age, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+# Density plot for PMI (ACC)
+p_pmi_bulk_ACC <- ggplot(bulk_ACC, aes(x = PMI, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 3, scales = "free_y") +
+  labs(x = "PMI", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = bulk_ACC_median_pmi, aes(xintercept = median_pmi, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = bulk_ACC_median_pmi,
+            aes(x = median_pmi, y = Inf, label = round(median_pmi, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+# Horizontal bar plot for reportedGender (ACC)
+p_gender_bulk_ACC <- ggplot(bulk_ACC, aes(x = reportedGender, fill = primaryDiagnosis)) +
+  geom_bar(position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values = diag_colors) +
+  coord_flip() +
+  facet_wrap(~ cohort, ncol = 3) +
+  labs(x = "Gender", y = "Count") +
+  theme(legend.position = "none") +
+  geom_text(data = bulk_ACC_gender_counts,
+            aes(x = reportedGender, y = count, label = count, group = primaryDiagnosis),
+            position = position_dodge(width = 0.9),
+            hjust = -0.1, size = 3) +
+  scale_y_continuous(limits = c(0, bulk_ACC_max_count * 1.2))
+
+# Combine ACC subplots into one composite panel
+bulk_ACC_plot <- (p_age_bulk_ACC / p_pmi_bulk_ACC / p_gender_bulk_ACC) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "Bulk ACC")
+
+#snRNAseq Plots (2 cohorts)
+sn_median_age <- snRNAseq_data %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_age = median(ageDeath, na.rm = TRUE), .groups = "drop")
+sn_median_pmi <- snRNAseq_data %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_pmi = median(PMI, na.rm = TRUE), .groups = "drop")
+sn_gender_counts <- snRNAseq_data %>%
+  group_by(cohort, reportedGender, primaryDiagnosis) %>%
+  summarise(count = n(), .groups = "drop")
+sn_max_count <- max(sn_gender_counts$count, na.rm = TRUE)
+
+p_age_sn <- ggplot(snRNAseq_data, aes(x = ageDeath, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 2, scales = "free_y") +
+  labs(x = "Age at Death", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = sn_median_age, aes(xintercept = median_age, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = sn_median_age,
+            aes(x = median_age, y = Inf, label = round(median_age, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+p_pmi_sn <- ggplot(snRNAseq_data, aes(x = PMI, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 2, scales = "free_y") +
+  labs(x = "PMI", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = sn_median_pmi, aes(xintercept = median_pmi, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = sn_median_pmi,
+            aes(x = median_pmi, y = Inf, label = round(median_pmi, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+p_gender_sn <- ggplot(snRNAseq_data, aes(x = reportedGender, fill = primaryDiagnosis)) +
+  geom_bar(position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values = diag_colors) +
+  coord_flip() +
+  facet_wrap(~ cohort, ncol = 2) +
+  labs(x = "Gender", y = "Count") +
+  theme(legend.position = "none") +
+  geom_text(data = sn_gender_counts,
+            aes(x = reportedGender, y = count, label = count, group = primaryDiagnosis),
+            position = position_dodge(width = 0.9),
+            hjust = -0.1, size = 3) +
+  scale_y_continuous(limits = c(0, sn_max_count * 1.2))
+
+sn_plot <- (p_age_sn / p_pmi_sn / p_gender_sn) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "snRNAseq")
+
+## LCMseq Plots (1 cohort)
+lcm_median_age <- lcm_data %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_age = median(ageDeath, na.rm = TRUE), .groups = "drop")
+lcm_median_pmi <- lcm_data %>%
+  group_by(cohort, primaryDiagnosis) %>%
+  summarise(median_pmi = median(PMI, na.rm = TRUE), .groups = "drop")
+lcm_gender_counts <- lcm_data %>%
+  group_by(cohort, reportedGender, primaryDiagnosis) %>%
+  summarise(count = n(), .groups = "drop")
+lcm_max_count <- max(lcm_gender_counts$count, na.rm = TRUE)
+
+p_age_lcm <- ggplot(lcm_data, aes(x = ageDeath, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 1, scales = "free_y") +
+  labs(x = "Age at Death", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = lcm_median_age, aes(xintercept = median_age, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = lcm_median_age,
+            aes(x = median_age, y = Inf, label = round(median_age, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+p_pmi_lcm <- ggplot(lcm_data, aes(x = PMI, fill = primaryDiagnosis)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = diag_colors) +
+  facet_wrap(~ cohort, ncol = 1, scales = "free_y") +
+  labs(x = "PMI", y = "Density") +
+  theme(legend.position = "none") +
+  geom_vline(data = lcm_median_pmi, aes(xintercept = median_pmi, color = primaryDiagnosis),
+             linetype = "dashed", size = 1) +
+  geom_text(data = lcm_median_pmi,
+            aes(x = median_pmi, y = Inf, label = round(median_pmi, 1), color = primaryDiagnosis),
+            vjust = -0.5, size = 3) +
+  scale_color_manual(values = diag_colors)
+
+p_gender_lcm <- ggplot(lcm_data, aes(x = reportedGender, fill = primaryDiagnosis)) +
+  geom_bar(position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values = diag_colors) +
+  coord_flip() +
+  facet_wrap(~ cohort, ncol = 1) +
+  labs(x = "Gender", y = "Count") +
+  theme(legend.position = "none") +
+  geom_text(data = lcm_gender_counts,
+            aes(x = reportedGender, y = count, label = count, group = primaryDiagnosis),
+            position = position_dodge(width = 0.9),
+            hjust = -0.1, size = 3) +
+  scale_y_continuous(limits = c(0, lcm_max_count * 1.2))
+
+lcm_plot <- (p_age_lcm / p_pmi_lcm / p_gender_lcm) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "FISH + LCMseq")
+
+
+## Final Combined Plot
+bottom_panel <- wrap_plots(
+  list(bulk_ACC_plot, sn_plot, lcm_plot),
+  ncol = 3,
+  widths = c(3, 2, 1)
+)
+
+final_plot <- wrap_plots(
+  list(bulk_DLPFC_plot, bottom_panel),
+  nrow = 2,
+  heights = c(1, 1)
+)
+
+final_plot
+
+```
+
+
+
+```{r}
+cohort_summary <- all_subjects %>%
+  group_by(cohort, brainArea, dataType) %>%
+  summarise(
+    PercentMale = mean(reportedGender == "M", na.rm = TRUE) * 100,
+    MeanAge   = mean(ageDeath, na.rm = TRUE),
+    SDAge     = sd(ageDeath, na.rm = TRUE),
+    MeanPMI   = mean(PMI, na.rm = TRUE),
+    SDPMI     = sd(PMI, na.rm = TRUE),
+    MeanRIN   = mean(RIN, na.rm = TRUE),  # For datasets without RIN, this will be NA
+    SDRIN     = sd(RIN, na.rm = TRUE),    # Same here
+    NumCases  = sum(primaryDiagnosis == "SCZ", na.rm = TRUE),
+    NumControls = sum(primaryDiagnosis == "CON", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    `Mean Age (SD)`  = sprintf("%.1f (%.1f)", MeanAge, SDAge),
+    `Mean PMI (SD)`  = sprintf("%.1f (%.1f)", MeanPMI, SDPMI),
+    `Mean RIN (SD)`  = ifelse(is.na(MeanRIN), NA, sprintf("%.1f (%.1f)", MeanRIN, SDRIN)),
+    `Dataset Name`   = cohort,
+    `RNA Type` = case_when(
+      dataType == "bulk" ~ "bulk",
+      dataType == "snRNAseq" ~ "snRNA",
+      dataType == "FISH+LCMseq" ~ "FISH"
+    )
+  ) %>%
+  select(`Dataset Name`, brainArea, PercentMale, `Mean Age (SD)`, `Mean PMI (SD)`, `Mean RIN (SD)`, `RNA Type`, NumCases, NumControls)
+
+```
+
+
+
+
+
+
+

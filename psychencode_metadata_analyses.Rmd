@@ -1,0 +1,327 @@
+---
+title: "psychencode_metadata_analyses"
+author: "Daniel Kiss"
+date: "9/26/2023"
+output: html_document
+---
+
+The following code should be run based on the variables generated in lines 1-72 of psychencode_figures_cleaned.Rmd
+
+Plot CTPs vs. ageOnset for each cohort
+```{r}
+#Note that CMC does not have ageOnset info - therefore we filter for dataset = GVEX and LIBD
+ctp_vs_ageonset = all_estimations_long %>%
+  filter(primaryDiagnosis %in% c('Schizophrenia'), cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP"), dataset %in% c("GVEX", "LIBD")) %>%
+  ggplot(aes(x = ageOnset, y = rel_prop, color = dataset)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = F, method = 'lm', fullrange = T) +
+  ylab('Relative Cell Prop.') + 
+  xlab('Age of Onset') + 
+  theme(
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(vjust = -2, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  facet_grid(~cell_type) +
+  scale_y_continuous(limits = c(-2, 2))
+
+ctp_vs_ageonset
+
+#Now let's plot the difference between ageDeath and ageOnset to calculate diagnosisLength
+ctp_vs_diagnosislength = all_estimations_long %>%
+  filter(primaryDiagnosis %in% c('Schizophrenia'), cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP"), dataset %in% c("GVEX", "LIBD")) %>%
+  mutate(diagnosisLength = ageDeath - ageOnset) %>%
+  ggplot(aes(x = diagnosisLength, y = rel_prop, color = dataset)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = F, method = 'lm', fullrange = T) +
+  ylab('Relative Cell Prop.') + 
+  xlab('Length of Diagnosis') + 
+  theme(
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(vjust = -2, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  facet_grid(~cell_type) +
+  scale_y_continuous(limits = c(-2, 2))
+
+ctp_vs_diagnosislength
+
+#ageOnset vs. ageDeath
+ageonset_vs_agedeath = all_estimations %>%
+  filter(primaryDiagnosis %in% c('Schizophrenia'), dataset %in% c("GVEX", "LIBD")) %>%
+  ggplot(aes(x = ageOnset, y = ageDeath, color = dataset)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = F, method = 'lm', fullrange = T) +
+  ylab('Age of Death.') + 
+  xlab('Age of Onset') + 
+  theme(
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(vjust = -2, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16))
+  scale_y_continuous(limits = c(-2, 2))
+
+ageonset_vs_agedeath
+                                
+```
+
+Replot ageOnset vs. CTP but regress out ageDeath
+```{r, fig.width=4, fig.height=3.5}
+#Model for ageOnset
+ageOnset_model = all_estimations_long %>% 
+  filter(primaryDiagnosis %in% c('Schizophrenia'), cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP"), dataset %in% c("GVEX", "LIBD")) %>% 
+  group_by(dataset, cell_type) %>%
+    do(tidy(lm(scale(rel_prop) ~ scale(ageDeath) + scale(RIN) + scale(PMI) + reportedGender +  scale(ageOnset), data = .)))
+
+CELL_TYPES = c("Inh_SST", "Inh_PVALB", "Inh_VIP")
+DATASETS = c("GVEX", "LIBD")
+ageOnset_residuals_data = matrix(ncol = (ncol(all_estimations_long)+1), nrow = 0) %>% data.frame()
+colnames(ageOnset_residuals_data) = c(colnames(all_estimations_long), "resid")
+
+for(DATASET in DATASETS) {
+  for(CELL_TYPE in CELL_TYPES) {
+    #Create res_model without ageOnset variable
+    res_model_data = all_estimations_long %>% filter(primaryDiagnosis %in% c('Schizophrenia'), cell_type == CELL_TYPE , dataset == DATASET)
+    #Model without ageOnset
+    res_model = lm(scale(rel_prop) ~ scale(ageDeath) + scale(RIN) + scale(PMI) + reportedGender, data = res_model_data)
+    #Calculate residuals and add column to res_model_data
+    res_model_data = res_model_data %>% add_residuals(var = "resid", model = res_model)
+    ageOnset_residuals_data = ageOnset_residuals_data %>% rbind(res_model_data)
+  }
+}
+
+#Plot ageOnst vs. Residuals
+resid_vs_ageonset <- ageOnset_residuals_data %>%
+  ggplot(aes(x = ageOnset, y = resid, color = dataset)) +
+  geom_point(alpha = 0.5, size = 0.5) + 
+  geom_smooth(se = FALSE, method = 'lm', fullrange = TRUE) +
+  ylab('Residualized CTP Estimate') + 
+  xlab('Age of Onset') + 
+  theme(
+    axis.text.x = element_text(size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.title.x = element_text(vjust = -2, size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16),
+    strip.text = element_text(size = 16),
+    legend.text = element_text(size = 16),
+    plot.margin = margin(10, 10, 20, 10)) +
+  facet_grid(cols = vars(cell_type), rows = vars(dataset)) +
+  scale_y_continuous(limits = c(-1.5, 1.5)) + 
+  scale_color_manual(values = c("dodgerblue2", "firebrick2")) +
+  guides(color = guide_legend(title = NULL)) +
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~")), color = "black", geom = "label")
+
+
+resid_vs_ageonset
+
+#Save to plot folder
+output_filename <- "~/cell_prop_psychiatry/plots/figure_4.pdf"
+
+# Use ggsave to save the plot as a JPG image
+ggsave(output_filename, resid_vs_ageonset, width = 8, height = 6, dpi = 200)
+
+```
+
+Let's look into correlations between cause of death and the residuals of PV and SST proportions.
+```{r}
+CELL_TYPES = c("Inh_SST", "Inh_PVALB", "Inh_VIP")
+DATASETS = c("GVEX", "LIBD")
+residuals_data = matrix(ncol = (ncol(all_estimations_long)+1), nrow = 0) %>% data.frame()
+colnames(residuals_data) = c(colnames(all_estimations_long), "resid")
+
+for(DATASET in DATASETS) {
+  for(CELL_TYPE in CELL_TYPES) {
+    #Create res_model 
+    res_model_data = all_estimations_long %>% filter(primaryDiagnosis %in% c('Schizophrenia', 'control'), cell_type == CELL_TYPE , dataset == DATASET)
+    res_model = lm(scale(rel_prop) ~ scale(ageDeath) + scale(RIN) + scale(PMI) + reportedGender, data = res_model_data)
+    #Calculate residuals and add column to res_model_data
+    res_model_data = res_model_data %>% add_residuals(var = "resid", model = res_model)
+    residuals_data = residuals_data %>% rbind(res_model_data)
+  }
+}
+
+#Add filtered causeDeath column
+residuals_data  = residuals_data %>%
+    mutate(causeDeath_filtered = ifelse(grepl("SUIC", toupper(causeDeath)), "suicide", "other"))
+
+#Plot causeDeath vs. Residuals
+resid_vs_ageonset = residuals_data %>%
+  filter(primaryDiagnosis == 'Schizophrenia') %>%
+  ggplot(aes(x = causeDeath_filtered, y = ageDeath)) +
+  geom_boxplot() +
+  ylab('Age of Death') + 
+  xlab('Cause of Death') + 
+  theme(
+    axis.text.x = element_text(size = 13, angle = 90),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(vjust = -2, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  facet_grid(cols = vars(newStudy)) 
+  #scale_y_continuous(limits = c(-2, 2)) 
+resid_vs_ageonset
+
+#Plot causeDeath vs. Residuals
+resid_vs_ageonset = residuals_data %>% 
+  filter(primaryDiagnosis == 'Schizophrenia') %>%
+  ggplot(aes(x = causeDeath_filtered, y = resid, color = newStudy)) +
+  geom_boxplot() +
+  ylab('Residualized CTP Estimate') + 
+  xlab('Cause of Death') + 
+  theme(
+    axis.text.x = element_text(size = 13, angle = 90),
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(vjust = -2, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  facet_grid(cols = vars(cell_type), rows = vars(newStudy)) 
+  #scale_y_continuous(limits = c(-2, 2)) 
+resid_vs_ageonset
+
+
+
+```
+
+
+Let's make some more figures. Here's what we need to illustrate:
+-Having SCZ when dying younger = less interneurons
+-Dying by suicide = less interneurons 
+-Dying by suicide and dying young w/ SCZ are almost completely confounded 
+-Having SCZ and dying younger = more brain pathology
+-Having SCZ and dying older = paradoxically less brain pathology 
+
+Plot 1:
+Re-do figure 2 from the main figures, but with only GVEX and LIBD 
+-Model using controls and SCZ + Suicide deaths
+-Model using controls and SCZ - Suicide deaths
+
+```{r}
+# Create function to map age to age range
+age_to_range <- function(age) {
+  if (age >= 90) {
+    "90+"
+  } else {
+    lower_bound <- floor(age / 10) * 10
+    upper_bound <- lower_bound + 9
+    paste0(lower_bound, "-", upper_bound)
+  }
+}
+#Create aggregated causeDeath column
+all_estimations_long$age_range = sapply(all_estimations_long$ageDeath, age_to_range)
+all_estimations_long = all_estimations_long %>%
+    mutate(causeDeath_filtered = ifelse(grepl("SUIC", toupper(causeDeath)), "suicide",
+                                        ifelse(grepl("DROWNING|STRANGULATION|INFECTION|ASPHYX|FALL|ACCIDENT|TRAUMA|MVA|OD|HOMIC|HEMORR", toupper(causeDeath)), "accident",
+                                        ifelse(grepl("CARD|PULM", toupper(causeDeath)), "cardio",
+                                        ifelse(grepl("NATURAL|CANCER|CIRROSIS|COPD|PNEU|SLEEP|PANCREAT|ASTHM", toupper(causeDeath)), "natural",
+                                               "other")))))
+```
+
+```{r}
+#Filter to include all controls, and only SCZ cases that did NOT die by suicide -> Cut off at ageDeath < 90 to have enough data for grouping
+mega_lms_by_age_no_suicide = all_estimations_long %>% 
+  filter(dataset %in% c("GVEX", "LIBD"), ageDeath < 50) %>% 
+  filter(primaryDiagnosis == 'control' | (primaryDiagnosis == 'Schizophrenia' & causeDeath_filtered == "other")) %>%
+  group_by(age_range, cell_type) %>%
+  do(tidy(lm(scale(rel_prop) ~ scale(RIN) + scale(PMI) + reportedGender + primaryDiagnosis + newStudy, data = .))) %>%
+  ungroup() %>% 
+  mutate(padj = p.adjust(`p.value`, method = 'BH')) %>%
+  mutate(class = case_when(
+    str_detect(cell_type, "Inh") ~ "Inhibitory",
+    str_detect(cell_type, "Exc") ~ "Excitatory",
+    TRUE ~ "Non-Neuronal")) %>%
+  mutate(term = recode(term,
+                       `(Intercept)` = "Intercept",
+                       `reportedGendermale` = "gender:Male",
+                       `primaryDiagnosisSchizophrenia` = "SCZ",
+                       `scale(ageDeath)` = "ageDeath",
+                       `scale(PMI)` = "PMI", 
+                       `newStudyNIMH_HBCC` = "NIMH_HBCC",
+                       `newStudyPitt` = "Pitt",
+                       `newStudyMSSM` = "MSSM",
+                       `newStudyPenn` = "Penn",
+                       `scale(RIN)` = "RIN"))
+
+
+#Plot it
+mega_lms_by_age_no_suicide %>% 
+  filter(term %in% 'SCZ' & cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP")) %>% 
+  mutate(cell_type = fct_reorder(cell_type, estimate)) %>% 
+  ggplot(aes(x = age_range, y = estimate)) + 
+  geom_hline(yintercept = 0) + 
+  geom_bar(stat = "identity", position = "dodge") + 
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error)) + 
+  ylab('Beta Coefficient') + 
+  xlab('\n \n Age Range') +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 13), 
+    axis.text.y = element_text(size = 13),
+    axis.title.x = element_text(vjust = 8, size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text.x = element_text(size = 16)) +
+  facet_wrap(~cell_type, drop = T, scale = "free_x") +
+  guides(fill = "none") +
+  scale_y_continuous(limits = c(-1.0, 1.4))
+
+#This looks weird -> likely because removing CMC data removes a LOT of older subjects
+
+```
+
+In ageDeath <50, SCZ, and interneurons:
+-Barplot CTP for suicide deaths vs. accident vs. cardiovascular 
+-Scatterplot for CTP vs ageDeath in only suicide deaths 
+```{r}
+CELL_TYPES = c("Inh_SST", "Inh_PVALB", "Inh_VIP")
+DATASETS = c("GVEX", "LIBD")
+
+
+residuals_data = matrix(ncol = (ncol(all_estimations_long)+1), nrow = 0) %>% data.frame()
+colnames(residuals_data) = c(colnames(all_estimations_long), "resid")
+for(DATASET in DATASETS) {
+  for(CELL_TYPE in CELL_TYPES) {
+    #Create res_model -> no ageDeath
+    res_model_data = all_estimations_long %>% filter(cell_type == CELL_TYPE , dataset == DATASET, primaryDiagnosis %in% c("control", "Schizophrenia"))
+    res_model_data$primaryDiagnosis = res_model_data$primaryDiagnosis %>% factor(levels = c("control", "Schizophrenia"))
+    res_model = lm(scale(rel_prop) ~ primaryDiagnosis + scale(ageDeath) + scale(RIN) + scale(PMI) + reportedGender, data = res_model_data)
+    #Calculate residuals and add column to res_model_data
+    res_model_data = res_model_data %>% add_residuals(var = "resid", model = res_model)
+    residuals_data = residuals_data %>% rbind(res_model_data)
+  }
+}
+
+residuals_data %>% filter() %>%
+  ggplot(aes(x = causeDeath_filtered, y = resid)) +
+  geom_boxplot(outlier.shape = NA, show.legend = F, notch = F, aes(fill = causeDeath_filtered, alpha = 0.5)) +
+  geom_beeswarm(size = 3, alpha = 0.3, aes(colour = causeDeath_filtered), show.legend = F) +
+  facet_grid(cols = vars(cell_type)) +
+  geom_signif(comparisons = combn(c("suicide", "accident", "natural", "cardio"), 2) %>% t() %>% split(1:4), map_signif_level = TRUE)
+
+
+
+all_estimations_long %>%
+mutate(causeDeath_filtered = ifelse(grepl("SUIC", toupper(causeDeath)), "suicide", "other")) %>%
+ filter(primaryDiagnosis %in% c('Schizophrenia', 'control'), 
+        cell_type %in% c("Inh_SST", "Inh_PVALB", "Inh_VIP"), 
+        dataset %in% c("GVEX", "LIBD")) %>%
+  ggplot(aes(x = ageDeath, y = rel_prop, color = causeDeath_filtered)) +
+  geom_point(size = 0.5) +
+  geom_smooth(method = lm, se = F) +
+  scale_y_continuous(limits = c(-2.5, 2.5)) +
+  facet_grid(cols = vars(primaryDiagnosis), rows = vars(dataset))
+  
+```
+
+What have we learned?
+-It's basically impossible to disentangle young ageDeath from death by suicide 
+-AgeDeath and CauseDeath are related, 
+
+
+
+
+
+
+
+
+
