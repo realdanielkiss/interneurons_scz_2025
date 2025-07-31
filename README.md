@@ -1,7 +1,7 @@
 # Cortical GABAergic neuron dysregulation in schizophrenia is age dependent
 
 [![DOI](https://img.shields.io/badge/medRxiv-10.1101%2F2024.10.23.24315986v1-blue.svg)](https://www.medrxiv.org/content/10.1101/2024.10.23.24315986v1)
-[![GitHub](https://img.shields.io/badge/GitHub-realdanielkiss/interneurons_scz_2025-green.svg)](https://www.https://github.com/realdanielkiss/interneurons_scz_2025)
+[![GitHub](https://img.shields.io/badge/GitHub-realdanielkiss/interneurons_scz_2025-green.svg)](https://github.com/realdanielkiss/interneurons_scz_2025)
 [![License](https://img.shields.io/badge/Lisence-creativecommons-red.svg)](https://creativecommons.org/licenses/by-nc/4.0)
 
 This repository holds the code, data-processing pipelines, and result notebooks for our 2025 study  
